@@ -576,7 +576,17 @@ export interface SettlementDiagnostic {
 	afterCompactionSettlement?: boolean;
 }
 
+/** Host-observed human input, not parent steering or an acceptance verdict. */
+export interface NativeHumanIntervention {
+	source: "interactive";
+	accepted: number;
+	delivered: number;
+	firstAcceptedAt: number;
+	lastAcceptedAt: number;
+}
+
 export interface EffectsProjection {
+	humanIntervention?: NativeHumanIntervention;
 	fileMutation?: FileMutationEffect;
 	settlementDiagnostic?: SettlementDiagnostic;
 }
@@ -1333,6 +1343,8 @@ export interface SpawnBudgetSnapshot {
 /** Slim per-child projection of a terminal result payload, safe to surface in tool_result details. */
 export interface WaitCompletionChild {
 	agent?: string;
+	/** Bounded human provenance survives result-file consumption and replay. */
+	effects?: Pick<EffectsProjection, "humanIntervention">;
 	/** Child run identity where the producer records one (workflow children); artifact files are keyed by it. */
 	runId?: string;
 	/** Bounded accounting projection used by /subagent-cost after async completion. */
@@ -1760,6 +1772,7 @@ export interface ExternalJobRunnerStatus {
 }
 
 export interface ExternalJobStatus {
+	launchRequirements?: import("../api/external-job-provider.ts").ExternalJobLaunchRequirements;
 	provider: string;
 	providerJobId?: string;
 	promptDigest: string;
@@ -1798,6 +1811,7 @@ export interface ExternalProcessStatus {
 }
 
 export interface AsyncStatus {
+	nativeExecution?: import("../api/native-execution-provider.ts").NativeExecutionBinding;
 	/** Exact reference returned by successful current workflow receipt publication. */
 	workflowReceiptPath?: string;
 	lifecycleArtifactVersion?: SubagentLifecycleArtifactVersion;

@@ -1,11 +1,12 @@
+import { runAttestedExternalJob as runExternalJob, requestAttestedExternalJobOperation as requestExternalJobOperation, writeExternalJobFixtureFile } from "../support/external-job-fixture.ts";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { EXTERNAL_JOB_PROVIDER_REGISTRY_KEY, ExternalJobProviderError, registerExternalJobProvider } from "../../src/api/external-job-provider.ts";
-import { EXTERNAL_JOB_BRIDGE_REQUEST_DIR, requestExternalJobOperation, serviceExternalJobBridgeRequestFile, serviceExternalJobBridgeRequests } from "../../src/runs/shared/external-job-bridge.ts";
-import { externalJobFollowUpRequestDigest, externalJobFollowUpRequestId, externalJobPromptDigest, runExternalJob } from "../../src/runs/shared/external-job-runner.ts";
+import { EXTERNAL_JOB_BRIDGE_REQUEST_DIR, serviceExternalJobBridgeRequestFile, serviceExternalJobBridgeRequests } from "../../src/runs/shared/external-job-bridge.ts";
+import { externalJobFollowUpRequestDigest, externalJobFollowUpRequestId, externalJobPromptDigest } from "../../src/runs/shared/external-job-runner.ts";
 
 const tempDirs: string[] = [];
 
@@ -80,7 +81,7 @@ describe("external-job runner bridge", () => {
 	it("reattaches an existing provider job instead of redispatching the prompt", async () => {
 		const dir = tempDir("pi-external-job-reattach-");
 		const prompt = "same prompt";
-		fs.writeFileSync(path.join(dir, "status.json"), JSON.stringify({
+		writeExternalJobFixtureFile(path.join(dir, "status.json"), JSON.stringify({
 			steps: [{
 				externalJob: {
 					provider: "surf-oracle",
@@ -155,7 +156,7 @@ describe("external-job runner bridge", () => {
 		const requestDir = path.join(dir, EXTERNAL_JOB_BRIDGE_REQUEST_DIR);
 		fs.mkdirSync(requestDir, { recursive: true });
 		fs.mkdirSync(path.join(requestDir, "start-timeout.claim"));
-		fs.writeFileSync(path.join(requestDir, "start-timeout.json"), JSON.stringify({
+		writeExternalJobFixtureFile(path.join(requestDir, "start-timeout.json"), JSON.stringify({
 			id: "start-timeout",
 			operation: "start",
 			provider: "surf-oracle",
@@ -199,7 +200,7 @@ describe("external-job runner bridge", () => {
 		});
 		const requestDir = path.join(dir, EXTERNAL_JOB_BRIDGE_REQUEST_DIR);
 		fs.mkdirSync(requestDir, { recursive: true });
-		fs.writeFileSync(path.join(requestDir, "start-race.json"), JSON.stringify({
+		writeExternalJobFixtureFile(path.join(requestDir, "start-race.json"), JSON.stringify({
 			id: "start-race",
 			operation: "start",
 			provider: "surf-oracle",
@@ -242,8 +243,8 @@ describe("external-job runner bridge", () => {
 		const claimDir = path.join(requestDir, "start-long.claim");
 		fs.mkdirSync(requestDir, { recursive: true });
 		fs.mkdirSync(claimDir);
-		fs.writeFileSync(path.join(claimDir, "owner.json"), JSON.stringify({ version: 1, pid: process.pid, hostname: os.hostname(), claimedAt: 1 }), "utf-8");
-		fs.writeFileSync(path.join(claimDir, "request.json"), JSON.stringify({
+		writeExternalJobFixtureFile(path.join(claimDir, "owner.json"), JSON.stringify({ version: 1, pid: process.pid, hostname: os.hostname(), claimedAt: 1 }), "utf-8");
+		writeExternalJobFixtureFile(path.join(claimDir, "request.json"), JSON.stringify({
 			id: "start-long",
 			operation: "start",
 			provider: "surf-oracle",
@@ -280,8 +281,8 @@ describe("external-job runner bridge", () => {
 		const requestDir = path.join(dir, EXTERNAL_JOB_BRIDGE_REQUEST_DIR);
 		const claimDir = path.join(requestDir, "start-abandoned.claim");
 		fs.mkdirSync(claimDir, { recursive: true });
-		fs.writeFileSync(path.join(claimDir, "owner.json"), JSON.stringify({ version: 1, pid: 9_999_999, hostname: os.hostname(), claimedAt: 1 }), "utf-8");
-		fs.writeFileSync(path.join(claimDir, "request.json"), JSON.stringify({
+		writeExternalJobFixtureFile(path.join(claimDir, "owner.json"), JSON.stringify({ version: 1, pid: 9_999_999, hostname: os.hostname(), claimedAt: 1 }), "utf-8");
+		writeExternalJobFixtureFile(path.join(claimDir, "request.json"), JSON.stringify({
 			id: "start-abandoned",
 			operation: "start",
 			provider: "surf-oracle",
@@ -322,8 +323,8 @@ describe("external-job runner bridge", () => {
 		const requestDir = path.join(dir, EXTERNAL_JOB_BRIDGE_REQUEST_DIR);
 		const claimDir = path.join(requestDir, "follow-up-abandoned.claim");
 		fs.mkdirSync(claimDir, { recursive: true });
-		fs.writeFileSync(path.join(claimDir, "owner.json"), JSON.stringify({ version: 1, pid: 9_999_999, hostname: os.hostname(), claimedAt: 1 }), "utf-8");
-		fs.writeFileSync(path.join(claimDir, "request.json"), JSON.stringify({
+		writeExternalJobFixtureFile(path.join(claimDir, "owner.json"), JSON.stringify({ version: 1, pid: 9_999_999, hostname: os.hostname(), claimedAt: 1 }), "utf-8");
+		writeExternalJobFixtureFile(path.join(claimDir, "request.json"), JSON.stringify({
 			id: "follow-up-abandoned",
 			operation: "follow-up",
 			provider: "surf-oracle",
@@ -368,8 +369,8 @@ describe("external-job runner bridge", () => {
 		const requestDir = path.join(dir, EXTERNAL_JOB_BRIDGE_REQUEST_DIR);
 		const claimDir = path.join(requestDir, "start-recovered.claim");
 		fs.mkdirSync(claimDir, { recursive: true });
-		fs.writeFileSync(path.join(claimDir, "owner.json"), JSON.stringify({ version: 1, pid: 9_999_999, hostname: os.hostname(), claimedAt: 1 }), "utf-8");
-		fs.writeFileSync(path.join(claimDir, "request.json"), JSON.stringify({
+		writeExternalJobFixtureFile(path.join(claimDir, "owner.json"), JSON.stringify({ version: 1, pid: 9_999_999, hostname: os.hostname(), claimedAt: 1 }), "utf-8");
+		writeExternalJobFixtureFile(path.join(claimDir, "request.json"), JSON.stringify({
 			id: "start-recovered",
 			operation: "start",
 			provider: "surf-oracle",
@@ -385,7 +386,7 @@ describe("external-job runner bridge", () => {
 				options: {},
 			},
 		}), "utf-8");
-		fs.writeFileSync(path.join(claimDir, "handle.json"), JSON.stringify({ providerJobId: "job-recovered", state: "running" }), "utf-8");
+		writeExternalJobFixtureFile(path.join(claimDir, "handle.json"), JSON.stringify({ providerJobId: "job-recovered", state: "running" }), "utf-8");
 
 		serviceExternalJobBridgeRequests(dir);
 
@@ -412,7 +413,7 @@ describe("external-job runner bridge", () => {
 		});
 		const requestDir = path.join(dir, EXTERNAL_JOB_BRIDGE_REQUEST_DIR);
 		fs.mkdirSync(requestDir, { recursive: true });
-		fs.writeFileSync(path.join(requestDir, "start-stale.json"), JSON.stringify({
+		writeExternalJobFixtureFile(path.join(requestDir, "start-stale.json"), JSON.stringify({
 			id: "start-stale",
 			operation: "start",
 			provider: "surf-oracle",
@@ -468,12 +469,12 @@ describe("external-job runner bridge", () => {
 				options: {},
 			},
 		};
-		fs.writeFileSync(path.join(requestDir, "start-completed.json"), JSON.stringify(request), "utf-8");
+		writeExternalJobFixtureFile(path.join(requestDir, "start-completed.json"), JSON.stringify(request), "utf-8");
 
 		serviceExternalJobBridgeRequests(dir);
 		await waitForFile(path.join(dir, "external-job-responses", "start-completed.json"));
 		fs.rmSync(path.join(dir, "external-job-responses", "start-completed.json"), { force: true });
-		fs.writeFileSync(path.join(requestDir, "start-completed.json"), JSON.stringify(request), "utf-8");
+		writeExternalJobFixtureFile(path.join(requestDir, "start-completed.json"), JSON.stringify(request), "utf-8");
 		serviceExternalJobBridgeRequests(dir);
 
 		assert.equal(starts, 1);
@@ -496,8 +497,8 @@ describe("external-job runner bridge", () => {
 			const id = `000-${String(index).padStart(3, "0")}`;
 			const claimDir = path.join(requestDir, `${id}.claim`);
 			fs.mkdirSync(claimDir);
-			fs.writeFileSync(path.join(claimDir, "completed.json"), JSON.stringify({ completedAt: 1 }), "utf-8");
-			fs.writeFileSync(path.join(requestDir, `${id}.json`), JSON.stringify({
+			writeExternalJobFixtureFile(path.join(claimDir, "completed.json"), JSON.stringify({ completedAt: 1 }), "utf-8");
+			writeExternalJobFixtureFile(path.join(requestDir, `${id}.json`), JSON.stringify({
 				id,
 				operation: "start",
 				provider: "surf-oracle",
@@ -513,7 +514,7 @@ describe("external-job runner bridge", () => {
 				},
 			}), "utf-8");
 		}
-		fs.writeFileSync(path.join(requestDir, "zzz.json"), JSON.stringify({
+		writeExternalJobFixtureFile(path.join(requestDir, "zzz.json"), JSON.stringify({
 			id: "zzz",
 			operation: "start",
 			provider: "surf-oracle",
@@ -538,7 +539,7 @@ describe("external-job runner bridge", () => {
 	it("does not start again after a bridge timeout without provider job id", async () => {
 		const dir = tempDir("pi-external-job-timeout-retry-");
 		const prompt = "prompt";
-		fs.writeFileSync(path.join(dir, "status.json"), JSON.stringify({
+		writeExternalJobFixtureFile(path.join(dir, "status.json"), JSON.stringify({
 			steps: [{
 				externalJob: {
 					provider: "surf-oracle",
@@ -578,7 +579,7 @@ describe("external-job runner bridge", () => {
 
 	it("fails closed when existing status.json is malformed", async () => {
 		const dir = tempDir("pi-external-job-corrupt-status-");
-		fs.writeFileSync(path.join(dir, "status.json"), "{ not json", "utf-8");
+		writeExternalJobFixtureFile(path.join(dir, "status.json"), "{ not json", "utf-8");
 		let starts = 0;
 		registerExternalJobProvider({
 			name: "surf-oracle",
@@ -607,7 +608,7 @@ describe("external-job runner bridge", () => {
 
 	it("fails closed when existing status.json has an invalid steps shape", async () => {
 		const dir = tempDir("pi-external-job-invalid-steps-");
-		fs.writeFileSync(path.join(dir, "status.json"), JSON.stringify({ steps: "nope" }), "utf-8");
+		writeExternalJobFixtureFile(path.join(dir, "status.json"), JSON.stringify({ steps: "nope" }), "utf-8");
 		let starts = 0;
 		registerExternalJobProvider({
 			name: "surf-oracle",
@@ -636,7 +637,7 @@ describe("external-job runner bridge", () => {
 
 	it("starts when existing status.json has a pending step without an external job", async () => {
 		const dir = tempDir("pi-external-job-pending-step-");
-		fs.writeFileSync(path.join(dir, "status.json"), JSON.stringify({
+		writeExternalJobFixtureFile(path.join(dir, "status.json"), JSON.stringify({
 			steps: [{ agent: "gpt-pro", status: "pending" }],
 		}), "utf-8");
 		let starts = 0;
@@ -700,7 +701,7 @@ describe("external-job runner bridge", () => {
 		const tombstone = fs.readdirSync(requestDir).find((entry) => entry.endsWith(".claim"));
 		assert.ok(tombstone);
 		const staleId = tombstone.replace(/\.claim$/, "");
-		fs.writeFileSync(path.join(requestDir, `${staleId}.json`), JSON.stringify({
+		writeExternalJobFixtureFile(path.join(requestDir, `${staleId}.json`), JSON.stringify({
 			id: staleId,
 			operation: "start",
 			provider: "surf-oracle",
@@ -885,7 +886,7 @@ describe("external-job runner bridge", () => {
 
 	it("does not redispatch an ambiguous follow-up without a provider job id", async () => {
 		const dir = tempDir("pi-external-job-follow-up-in-doubt-");
-		fs.writeFileSync(path.join(dir, "status.json"), JSON.stringify({
+		writeExternalJobFixtureFile(path.join(dir, "status.json"), JSON.stringify({
 			steps: [{
 				externalJob: {
 					provider: "surf-oracle",

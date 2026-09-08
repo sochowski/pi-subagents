@@ -1,3 +1,4 @@
+import { writeExternalJobFixtureFile } from "../support/external-job-fixture.ts";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -666,7 +667,7 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 			}), "utf-8");
 			const requestDir = path.join(runDir, EXTERNAL_JOB_BRIDGE_REQUEST_DIR);
 			fs.mkdirSync(requestDir, { recursive: true });
-			fs.writeFileSync(path.join(requestDir, "existing.json"), JSON.stringify({
+			writeExternalJobFixtureFile(path.join(requestDir, "existing.json"), JSON.stringify({
 				id: "existing",
 				operation: "start",
 				provider: "tracker-provider",
@@ -740,7 +741,7 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 			});
 			const requestDir = path.join(runDir, EXTERNAL_JOB_BRIDGE_REQUEST_DIR);
 			fs.mkdirSync(requestDir, { recursive: true });
-			fs.writeFileSync(path.join(requestDir, "late.json"), JSON.stringify({
+			writeExternalJobFixtureFile(path.join(requestDir, "late.json"), JSON.stringify({
 				id: "late",
 				operation: "start",
 				provider: "tracker-provider-late",

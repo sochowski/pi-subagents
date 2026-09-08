@@ -118,6 +118,7 @@ test("published extension APIs use supported package entrypoints", async () => {
 		"./agents": "./src/api/agents.ts",
 		"./background-work": "./src/api/background-work.ts",
 		"./external-job-provider": "./src/api/external-job-provider.ts",
+		"./native-execution-provider": "./src/api/native-execution-provider.ts",
 		"./external-runs": "./src/api/external-runs.ts",
 		"./capability-ceiling": "./src/api/capability-ceiling.ts",
 		"./workflow-resources": "./src/api/workflow-resources.ts",
@@ -140,6 +141,9 @@ test("published extension APIs use supported package entrypoints", async () => {
 	assert.equal(externalJobProvider.EXTERNAL_JOB_PROVIDER_PROTOCOL_VERSION, 1);
 	assert.equal(externalJobProvider.EXTERNAL_JOB_PROVIDER_REGISTRY_KEY, "pi-subagents.external-job-providers.v1");
 	assert.equal(typeof externalJobProvider.registerExternalJobProvider, "function");
+	const nativeProvider = await import("pi-subagents/native-execution-provider");
+	assert.equal(nativeProvider.NATIVE_EXECUTION_PROVIDER_VERSION, 1);
+	assert.equal(typeof nativeProvider.requireNativeExecutionProvider, "function");
 	const externalRuns = await import("pi-subagents/external-runs");
 	assert.equal(externalRuns.EXTERNAL_RUN_REGISTRY_VERSION, 2);
 	assert.equal(typeof externalRuns.registerExternalRun, "function");

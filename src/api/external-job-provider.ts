@@ -13,6 +13,48 @@ export type ExternalJobOperation = "start" | "follow-up" | "status" | "result" |
 
 export type ExternalJobOptions = Record<string, unknown>;
 
+export const EXTERNAL_JOB_LAUNCH_REQUIREMENTS_VERSION = 1 as const;
+
+/** Package-resolved restrictions, not provider options. null means provider defaults; [] means no tools. */
+export interface ExternalJobRequirements {
+	tools: { allowlist: string[] | null; exclude: string[]; required: string[]; allowNestedSubagents: boolean };
+	extensions: { disableAmbient: boolean; configured: string[] };
+	capabilityCeiling: import("./capability-ceiling.ts").ResolvedSubagentCapabilityCeiling | null;
+	/** Native execution features are rejected by admission, not emulated by this transport. */
+	nativeFeatures: "none";
+}
+
+export interface ExternalJobAdmission {
+	version: typeof EXTERNAL_JOB_LAUNCH_REQUIREMENTS_VERSION;
+	digest: string;
+	/** Package owner key (session file when persisted, otherwise native session id). */
+	ownerSessionId: string;
+	/** Native direct-parent session id, also used by process-local ceiling registrations. */
+	parentSessionId: string;
+	runId: string;
+	provider: string;
+	cwd: string;
+	agent: string;
+	definitionDigest: string;
+	systemPromptDigest: string;
+	optionsDigest: string;
+	requirements: ExternalJobRequirements;
+}
+
+/** Providers must enforce every requirement or throw before launching or recovering a job. */
+export interface ExternalJobLaunchRequirements {
+	version: typeof EXTERNAL_JOB_LAUNCH_REQUIREMENTS_VERSION;
+	digest: string;
+	admission: ExternalJobAdmission;
+	stepIndex: number;
+	promptDigest: string;
+	lineage: null | { sourceRunId: string; sourceStepIndex: number; parentProviderJobId: string; requestId: string; requestDigest: string; parentRequirementsDigest: string };
+}
+
+export interface ExternalJobOperationContext {
+	launchRequirements: ExternalJobLaunchRequirements;
+}
+
 export interface ExternalJobStartInput {
 	prompt: string;
 	promptDigest: string;
@@ -22,6 +64,7 @@ export interface ExternalJobStartInput {
 	agent: string;
 	options: ExternalJobOptions;
 	sessionId?: string;
+	launchRequirements: ExternalJobLaunchRequirements;
 }
 
 export interface ExternalJobFollowUpInput extends ExternalJobStartInput {
@@ -30,9 +73,12 @@ export interface ExternalJobFollowUpInput extends ExternalJobStartInput {
 	parentProviderJobId: string;
 	requestId: string;
 	requestDigest: string;
+	parentRequirementsDigest: string;
 }
 
 export interface ExternalJobHandle {
+	/** Required acknowledgement on every callback from an opted-in provider. */
+	launchRequirementsDigest?: string;
 	providerJobId: string;
 	state: ExternalJobState;
 	handleUrl?: string;
@@ -49,11 +95,13 @@ export interface ExternalJobResult extends ExternalJobHandle {
 
 export interface ExternalJobProvider {
 	name: string;
+	/** Opt in only when requirements are enforced or rejected before side effects, including recovery. */
+	launchRequirementsVersion?: typeof EXTERNAL_JOB_LAUNCH_REQUIREMENTS_VERSION;
 	start(input: ExternalJobStartInput): Promise<ExternalJobHandle> | ExternalJobHandle;
 	followUp?(input: ExternalJobFollowUpInput): Promise<ExternalJobHandle> | ExternalJobHandle;
-	status(providerJobId: string): Promise<ExternalJobHandle> | ExternalJobHandle;
-	result(providerJobId: string): Promise<ExternalJobResult> | ExternalJobResult;
-	reattach(providerJobId: string): Promise<ExternalJobHandle> | ExternalJobHandle;
+	status(providerJobId: string, context: ExternalJobOperationContext): Promise<ExternalJobHandle> | ExternalJobHandle;
+	result(providerJobId: string, context: ExternalJobOperationContext): Promise<ExternalJobResult> | ExternalJobResult;
+	reattach(providerJobId: string, context: ExternalJobOperationContext): Promise<ExternalJobHandle> | ExternalJobHandle;
 }
 
 export class ExternalJobProviderError extends Error {
@@ -117,7 +165,7 @@ function validateState(value: unknown, field: string): ExternalJobState {
 function validateHandle(provider: string, value: unknown, field: string, extraFields: readonly string[] = []): ExternalJobHandle {
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${field} from external-job provider '${provider}' must be an object.`);
 	const handle = value as Record<string, unknown>;
-	const supported = new Set(["providerJobId", "state", "handleUrl", "conversationUrl", "failureCode", "failureMessage", "blockingJobId", ...extraFields]);
+	const supported = new Set(["launchRequirementsDigest", "providerJobId", "state", "handleUrl", "conversationUrl", "failureCode", "failureMessage", "blockingJobId", ...extraFields]);
 	const unknown = Object.keys(handle).filter((key) => !supported.has(key));
 	if (unknown.length > 0) throw new Error(`${field} from external-job provider '${provider}' has unknown fields: ${unknown.join(", ")}.`);
 	const handleUrl = validateOptionalString(handle.handleUrl, `${field}.handleUrl`, MAX_URL_LENGTH);
@@ -126,6 +174,7 @@ function validateHandle(provider: string, value: unknown, field: string, extraFi
 	const failureMessage = validateOptionalString(handle.failureMessage, `${field}.failureMessage`, MAX_FAILURE_MESSAGE_LENGTH);
 	const blockingJobId = validateOptionalString(handle.blockingJobId, `${field}.blockingJobId`, MAX_JOB_ID_LENGTH);
 	return {
+		...(handle.launchRequirementsDigest !== undefined ? { launchRequirementsDigest: validateString(handle.launchRequirementsDigest, `${field}.launchRequirementsDigest`, 64) } : {}),
 		providerJobId: validateString(handle.providerJobId, `${field}.providerJobId`, MAX_JOB_ID_LENGTH),
 		state: validateState(handle.state, `${field}.state`),
 		...(handleUrl ? { handleUrl } : {}),

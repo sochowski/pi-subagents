@@ -53,6 +53,7 @@ export type ChildMessage = Message & {
 
 export interface ChildEvent {
 	type?: string;
+	humanIntervention?: EffectsProjection["humanIntervention"];
 	message?: ChildMessage;
 	toolName?: string;
 	toolCallId?: string;
@@ -312,6 +313,9 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 		// If the child emits its terminal event but its run never settles (a hook
 		// is stuck), abort it after a short grace period and then finish without it.
 		function startFinalDrain(): void {
+			// A native terminal response can be followed by human-steered work.
+			// Its host owns prompt settlement, not this generic terminal-event timer.
+			if (session?.hasPendingNativeWork) return;
 			if (childWatchdogIsActive(childWatchdogState)) {
 				armWatchdogTail();
 				return;
@@ -567,6 +571,7 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 					structuredOutputMessageStartIndex,
 					watchdog: childWatchdogState,
 					sessionFile: session?.sessionFile,
+					effects: session?.humanIntervention ? { humanIntervention: session.humanIntervention } : undefined,
 					currentTool,
 					currentToolArgs,
 					currentPath,

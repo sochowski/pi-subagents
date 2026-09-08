@@ -23,7 +23,7 @@ function ensureProxyAwareHttpDispatcher(): void {
 }
 const isRunnerEntrypoint = Boolean(process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href);
 if (isRunnerEntrypoint) ensureProxyAwareHttpDispatcher();
-import { writeAtomicJson } from "../../shared/atomic-json.ts";
+import { writeAtomicJson, writePrivateAtomicJson } from "../../shared/atomic-json.ts";
 import { writeAsyncResultFile, writePendingAsyncResultFile } from "./result-files.ts";
 import { createFileCoalescer } from "../../shared/file-coalescer.ts";
 import { createCapacityResilientJsonWriter } from "../../shared/capacity-resilient-json.ts";
@@ -100,7 +100,8 @@ import type { ChildSessionFactory } from "../shared/child-session.ts";
 import { getSettledReadonlyChild, runChildSession, type ChildEvent, type RunChildSessionInput, type RunChildSessionResult, type StepSteerHandler } from "./run-child-session.ts";
 import { planReadonlyModelContinuation, READONLY_CONTINUATION_PROMPT, type LogicalRecoveryState } from "../shared/readonly-model-continuation.ts";
 import { getReadonlySessionEvidence } from "../shared/readonly-session-evidence.ts";
-import { loadRunnerChildSessionFactory } from "./runner-child-sessions.ts";
+import { readNativeRunnerConfig, validateNativeExecutionBinding, nativeRunnerConversationContract } from "./native-runner-route.ts";
+import { loadNativeHostDriver, loadRunnerChildSessionFactory } from "./runner-child-sessions.ts";
 import { SUBAGENT_CHILD_ENV } from "../shared/child-runtime-config.ts";
 import { deriveChildSessionName } from "../../shared/child-session-name.ts";
 import { alignForkedSessionCwd } from "../../shared/fork-session-cwd.ts";
@@ -185,6 +186,8 @@ const INTERCOM_DETACH_RECEIPT = "Detached for intercom coordination before task 
 process.env[SUBAGENT_CHILD_ENV] = "1";
 
 interface SubagentRunConfig {
+	nativeExecution?: import("../../api/native-execution-provider.ts").NativeExecutionBinding;
+	nativeContinuation?: import("../../api/native-execution-provider.ts").NativeExecutionBinding;
 	id: string;
 	steps: RunnerStep[];
 	resultPath: string;
@@ -954,6 +957,8 @@ export async function runSingleStepInner(
 		const outputSnapshot = captureSingleOutputSnapshot(step.outputPath);
 		const external = await runExternalJob(omitUndefinedProperties({
 			provider: runner.provider,
+			admission: step.externalJobAdmission,
+			systemPrompt: step.systemPrompt ?? "",
 			options: runner.options,
 			cwd: step.cwd ?? ctx.cwd,
 			prompt: buildExternalCliPrompt(step.systemPrompt ?? "", task),
@@ -1359,7 +1364,7 @@ export async function runSingleStepInner(
 			afterCompactionSettlement: run.afterCompactionSettlement === true,
 		});
 		const fileMutationEffect = completionEvidence.fileMutation ?? (missingRequiredOutputAfterMutation ? { status: "observed" as const, expected: completionEvidence.mutationExpected, attempted: true, evidence: mutationEvidence } : undefined);
-		finalResult = { ...run, exitCode: effectiveExitCode, model: candidate ?? run.model, error, structuredOutput, runtimeAcknowledgedExtensions, ...(step.agentContract ? { agentContract: step.agentContract } : {}), ...(fileMutationEffect || settlementDiagnostic ? { effects: { ...(fileMutationEffect ? { fileMutation: fileMutationEffect } : {}), ...(settlementDiagnostic ? { settlementDiagnostic } : {}) } } : {}) } as RunChildSessionResult;
+		finalResult = { ...run, exitCode: effectiveExitCode, model: candidate ?? run.model, error, structuredOutput, runtimeAcknowledgedExtensions, ...(step.agentContract ? { agentContract: step.agentContract } : {}), ...(fileMutationEffect || settlementDiagnostic ? { effects: { ...run.effects, ...(fileMutationEffect ? { fileMutation: fileMutationEffect } : {}), ...(settlementDiagnostic ? { settlementDiagnostic } : {}) } } : {}) } as RunChildSessionResult;
 		const abortRecovery = !attempt.success ? planAbortRecovery({
 			messages: run.messages,
 			error,
@@ -2088,6 +2093,7 @@ export async function runSubagent(
 	const statusPayload: RunnerStatusPayload = omitUndefinedProperties({
 		lifecycleArtifactVersion: SUBAGENT_LIFECYCLE_ARTIFACT_VERSION,
 		runId: id,
+		...(config.nativeExecution ? { nativeExecution: config.nativeExecution } : {}),
 		...(config.sessionId ? { sessionId: config.sessionId } : {}),
 		...(config.completionOwnerId ? { completionOwnerId: config.completionOwnerId } : {}),
 		mode: config.resultMode ?? (flatSteps.length > 1 ? "chain" : "single"),
@@ -2967,6 +2973,12 @@ export async function runSubagent(
 		const previousActivityState = step.activityState;
 		const now = Date.now();
 		statusPayload.currentStep = flatIndex;
+		if (event.type === "native_human_intervention" && event.humanIntervention) {
+			step.effects = { ...step.effects, humanIntervention: event.humanIntervention };
+			statusPayload.lastUpdate = now;
+			writeStatusPayload();
+			return;
+		}
 		if (isChildWatchdogStatusEvent(event)) {
 			const next = acceptChildWatchdogEvent({
 				current: step.watchdog,
@@ -5121,7 +5133,37 @@ async function runConfiguredSubagent(config: SubagentRunConfig): Promise<void> {
 		}
 		const childSessions = await loadRunnerChildSessionFactory(config);
 		try {
-			await runSubagent(config, childSessions);
+			let turnConfig = config;
+			for (;;) {
+				await runSubagent(turnConfig, childSessions);
+				if (!config.nativeExecution) break;
+				const retained = childSessions as import("../shared/native-interactive-host.ts").NativeInteractiveHost;
+				if (!retained.child) {
+					await retained.close();
+					if (retained.startupFailureSettled && turnConfig.runnerProcessInstanceId) {
+						const failed = readStatus(turnConfig.asyncDir);
+						if (failed?.runId !== turnConfig.id || failed.sessionId !== turnConfig.sessionId) throw new Error("Native startup failure status ownership mismatch.");
+						writePrivateAtomicJson(path.join(turnConfig.asyncDir, "status.json"), { ...failed, state: "failed", error: failed.error ?? "Native session creation/binding failed before dispatch.", processTerminal: { version: 1, state: "not-started", runId: turnConfig.id, runnerProcessInstanceId: turnConfig.runnerProcessInstanceId } });
+					}
+					break;
+				}
+				writePrivateAtomicJson(path.join(turnConfig.asyncDir, "native-tracking-release.json"), { ...turnConfig.nativeExecution, runnerProcessInstanceId: turnConfig.runnerProcessInstanceId, nativeId: retained.child?.sessionId, sessionFile: retained.child?.sessionFile, hostRetained: true });
+				await childSessions.dispose();
+				const controlPath = config.nativeExecution.controlPath;
+				if (!controlPath) throw new Error("Retained native host is missing its durable continuation route.");
+				while (!fs.existsSync(controlPath)) await new Promise((resolve) => setTimeout(resolve, 100));
+				const next = readNativeRunnerConfig(controlPath);
+				const binding = next.nativeExecution as import("../../api/native-execution-provider.ts").NativeExecutionBinding;
+				validateNativeExecutionBinding(next, binding);
+				if (nativeRunnerConversationContract(config as unknown as Record<string, unknown>) !== nativeRunnerConversationContract(next)) throw new Error("Retained native continuation contract changed.");
+				const host = childSessions as import("../shared/native-interactive-host.ts").NativeInteractiveHost;
+				host.beginContinuation(binding, await loadNativeHostDriver(binding));
+				// The sole retained writer has admitted this exact mailbox. This
+				// receipt resolves transport uncertainty without replaying a prompt.
+				writePrivateAtomicJson(path.join(String(next.asyncDir), "native-publication-observed.json"), { ...binding, runnerProcessInstanceId: next.runnerProcessInstanceId, publication: "published", hostPid: process.pid });
+				fs.unlinkSync(controlPath);
+				turnConfig = next as unknown as SubagentRunConfig;
+			}
 		} finally {
 			try {
 				await childSessions.dispose();
@@ -5161,7 +5203,7 @@ function startConfiguredSubagent(config: SubagentRunConfig): void {
 	// behind even after shutdown; the run is fully persisted by now, so exit
 	// explicitly instead of waiting for the event loop to drain.
 	runConfiguredSubagent(config).then(
-		() => process.exit(0),
+		() => { process.exit(0); },
 		(runErr) => {
 			console.error("Subagent runner error:", runErr);
 			process.exit(1);

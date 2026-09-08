@@ -1,3 +1,7 @@
+import { nativeContinuationAcceptanceInput, readNativeContinuation, readNativeRunnerConfig } from "../background/native-runner-route.ts";
+import { requiredNativeProvider } from "../../api/native-execution-provider.ts";
+import { agentDefinitionDigest } from "../../shared/launch-contract.ts";
+import { assertExternalJobProviderHandle, assertCurrentExternalJobCeiling, externalJobUnsupportedFeatures, readExternalJobContract, validateExternalJobLaunchRequirements } from "../shared/external-job-contract.ts";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -1663,14 +1667,35 @@ async function resumeExternalJobFollowUp(input: {
 	const support = providerFollowUpSupport(runner.provider);
 	if (!support.ok) return { content: [{ type: "text", text: support.message }], isError: true, details: { mode: "management", results: [] } };
 
+	let inheritedRequirements;
+	try {
+		inheritedRequirements = validateExternalJobLaunchRequirements(externalJob.launchRequirements);
+		const a = inheritedRequirements.admission;
+		if (!input.target.asyncDir || readExternalJobContract(input.target.asyncDir, input.target.index).digest !== inheritedRequirements.digest
+			|| a.ownerSessionId !== input.deps.state.currentSessionId || a.parentSessionId !== input.ctx.sessionManager.getSessionId() || a.provider !== runner.provider || a.cwd !== input.effectiveCwd || a.agent !== input.target.agent
+			|| a.runId !== input.target.runId || inheritedRequirements.stepIndex !== input.target.index || inheritedRequirements.promptDigest !== externalJob.promptDigest) throw new Error("External-job continuation requirements binding mismatch.");
+		assertExternalJobProviderHandle(input.target.asyncDir, inheritedRequirements, externalJob.providerJobId);
+		assertCurrentExternalJobCeiling(inheritedRequirements);
+		const unsupported = externalJobUnsupportedFeatures(input.baseAgentConfig, { permissions: input.deps.config.permissions, thinkingCeiling: input.deps.childRuntime?.thinkingCeiling });
+		if (unsupported.length) throw new Error(`External-job continuation does not support: ${unsupported.join(", ")}.`);
+	} catch (error) {
+		return { content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }], isError: true, details: { mode: "management", results: [] } };
+	}
 	const promptDigest = externalJobPromptDigest(input.followUp);
-	const requestDigest = externalJobFollowUpRequestDigest({ provider: runner.provider, parentProviderJobId: externalJob.providerJobId, promptDigest, options: runner.options });
+	const requestDigest = externalJobFollowUpRequestDigest({ provider: runner.provider, parentProviderJobId: externalJob.providerJobId, promptDigest, options: runner.options, parentRequirementsDigest: inheritedRequirements.digest });
 	const requestId = externalJobFollowUpRequestId(requestDigest);
 	const runId = externalJobFollowUpRunId(requestDigest);
 	const asyncDir = path.join(DIRS.async, runId);
 	const currentSessionId = input.deps.state.currentSessionId;
 	if (!currentSessionId) return { content: [{ type: "text", text: "External-job follow-up requires an active parent session." }], isError: true, details: { mode: "management", results: [] } };
 	if (fs.existsSync(asyncDir) || fs.existsSync(resultFilePath(DIRS.results, runId))) {
+		try {
+			const duplicate = readExternalJobContract(asyncDir, 0);
+			if (duplicate.admission.ownerSessionId !== currentSessionId || duplicate.admission.cwd !== input.effectiveCwd || duplicate.admission.provider !== runner.provider
+				|| duplicate.lineage?.parentRequirementsDigest !== inheritedRequirements.digest || duplicate.lineage?.requestDigest !== requestDigest
+				|| duplicate.admission.definitionDigest !== agentDefinitionDigest({ ...input.baseAgentConfig, runner: { type: "external-job", provider: runner.provider, options: runner.options } })) throw new Error("External-job duplicate continuation binding mismatch.");
+			assertCurrentExternalJobCeiling(duplicate);
+		} catch (error) { return { content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }], isError: true, details: { mode: "management", results: [] } }; }
 		return externalJobFollowUpStarted({ sourceRunId: input.target.runId, runId, asyncDir, duplicate: true, interactive: input.ctx.hasUI });
 	}
 
@@ -1741,7 +1766,8 @@ async function resumeExternalJobFollowUp(input: {
 		capabilityCeiling: resolveCurrentSubagentCapabilityCeiling(currentSessionId),
 		runFanoutBudget: createRunFanoutBudget(runId, resolveMaxSubagentSpawnsPerRun(input.deps.config.maxSubagentSpawnsPerRun)),
 		activeAsyncCapacity,
-		externalJobFollowUp: { sourceRunId: input.target.runId, sourceStepIndex: input.target.index, parentProviderJobId: externalJob.providerJobId, requestId, requestDigest },
+		externalJobInheritedRequirements: inheritedRequirements,
+		externalJobFollowUp: { parentRequirementsDigest: inheritedRequirements.digest, sourceRunId: input.target.runId, sourceStepIndex: input.target.index, parentProviderJobId: externalJob.providerJobId, requestId, requestDigest },
 	}));
 	if (result.isError) {
 		activeAsyncCapacity?.rollback();
@@ -2027,6 +2053,19 @@ async function resumeAsyncRun(input: {
 	if (input.params.baseRef !== undefined && "managedWorktree" in target && target.managedWorktree === true) {
 		return { content: [{ type: "text", text: "Cannot resume with baseRef: retained managed-worktree children continue in their existing worktree. Start a new worktree run from that base ref instead." }], isError: true, details: { mode: "management", results: [] } };
 	}
+	let nativeContinuation: import("../../api/native-execution-provider.ts").NativeExecutionBinding | undefined;
+	let nativeDefinitionDigest: string | undefined;
+	if (fs.existsSync(`${revivalSessionFile}.native-host.json`)) {
+		try {
+			if (!sourceAsyncDir || target.index !== 0 || input.params.context !== undefined || input.params.skill !== undefined || input.params.worktree !== undefined || input.params.baseRef !== undefined || input.params.cwd !== undefined && input.requestCwd !== effectiveCwd) throw new Error("Native public resume requires one exact async child and does not accept context, skill, checkout or cwd changes.");
+			nativeContinuation = readNativeContinuation({ sessionFile: revivalSessionFile, asyncDir: sourceAsyncDir, runId: target.runId, ownerSessionId: input.deps.state.currentSessionId!, parentSessionId: input.ctx.sessionManager.getSessionId() });
+			const previous = readNativeRunnerConfig(path.join(sourceAsyncDir, "native-runner.json"));
+			const step = (previous.steps as Array<{ definitionDigest?: string }>)[0];
+			const current = agents.find((agent) => agent.name === target.agent);
+			if (!current || step?.definitionDigest !== agentDefinitionDigest(current)) throw new Error("Native retained role definition changed; current profile must be re-admitted, never weakened by recovery.");
+			nativeDefinitionDigest = step.definitionDigest;
+		} catch (error) { return { content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }], isError: true, details: { mode: "management", results: [] } }; }
+	}
 	const runId = randomUUID();
 	const topLevelResume = depth === 0 && !inheritedNestedRoute(input.deps) && !input.params.workflowParentRunId;
 	let activeAsyncCapacity: ActiveAsyncCapacityHandle | undefined;
@@ -2062,7 +2101,9 @@ async function resumeAsyncRun(input: {
 	const revivalAsyncDir = path.join(DIRS.async, runId);
 	const result = executeAsyncSingle(runId, compactOptional<Parameters<typeof executeAsyncSingle>[1]>({
 		agent: target.agent,
-		task: buildRevivedAsyncTask(target as Parameters<typeof buildRevivedAsyncTask>[0], effectiveFollowUp),
+		task: nativeContinuation
+			? `You are continuing this same retained native conversation, not reviving or reopening a session. Your admitted role, tools, ceilings and acceptance still apply.\n\nFollow-up:\n${effectiveFollowUp}`
+			: buildRevivedAsyncTask(target as Parameters<typeof buildRevivedAsyncTask>[0], effectiveFollowUp),
 		goal: effectiveFollowUp,
 		agentConfig,
 		recoveryAgentConfig,
@@ -2088,12 +2129,12 @@ async function resumeAsyncRun(input: {
 		sessionRoot: input.deps.getSubagentSessionRoot(parentSessionFile ?? revivalSessionFile),
 		...(recoveryDescriptor?.sessionDir ? { sessionDir: recoveryDescriptor.sessionDir } : {}),
 		sessionFile: revivalSessionFile,
-		revivalLease: {
+		...(nativeContinuation ? { nativeContinuation, nativeDefinitionDigest } : { revivalLease: {
 			sessionFile: revivalSessionFile,
 			runId,
 			sourceRunId: target.runId,
 			...(input.deps.state.currentSessionId ? { parentSessionId: input.deps.state.currentSessionId } : {}),
-		},
+		} }),
 		context: recoveryContext,
 		modelOverride: recoveryDescriptor?.model ?? target.model,
 		fast: recoveryDescriptor?.fast,
@@ -2127,7 +2168,7 @@ async function resumeAsyncRun(input: {
 		...(agentContract ? { agentContract } : {}),
 		...(outputSchema ? { structuredOutputSchema: outputSchema } : {}),
 		...(recoveryDescriptor?.skills ? { skills: [...recoveryDescriptor.skills] } : {}),
-		...(input.params.acceptance !== undefined ? { acceptance: input.params.acceptance } : foregroundContract?.acceptance !== undefined ? { acceptance: foregroundContract.acceptance } : recoveryDescriptor?.acceptance !== undefined ? { acceptance: recoveryDescriptor.acceptance } : {}),
+		acceptance: nativeContinuationAcceptanceInput(nativeContinuation, input.params.acceptance, foregroundContract?.acceptance ?? recoveryDescriptor?.acceptance),
 		...(input.params.timeoutMs !== undefined ? { timeoutMs: input.params.timeoutMs } : {}),
 		...(input.absoluteDeadlineAt !== undefined ? { absoluteDeadlineAt: input.absoluteDeadlineAt } : {}),
 		...(input.params.toolBudget !== undefined ? { toolBudget: input.params.toolBudget } : {}),
@@ -2219,8 +2260,8 @@ async function resumeAsyncRun(input: {
 	const revivedTarget = intercomBridge.active ? resolveSubagentIntercomTarget(revivedId, target.agent, 0) : undefined;
 	const sourceLabel = target.source;
 	const lines = [
-		`Revived ${sourceLabel} subagent from ${target.runId}.`,
-		`Revived run: ${revivedId}`,
+		nativeContinuation ? `Continued retained native child from ${target.runId}; no new host or SDK writer was started.` : `Revived ${sourceLabel} subagent from ${target.runId}.`,
+		`${nativeContinuation ? "Turn tracking run" : "Revived run"}: ${revivedId}`,
 		`Agent: ${target.agent}`,
 		`Session: ${target.sessionFile}`,
 		result.details.asyncDir ? `Async dir: ${result.details.asyncDir}` : undefined,
@@ -4861,6 +4902,16 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		preserveActiveSession = false,
 		parentModelOverride?: ParentModel | null,
 	): Promise<AgentToolResult<Details>> => {
+		// Session getters can have side effects or fail; capture the requested model
+		// before provider admission, and let diagnostics report broken sessions.
+		const entryParentModel = normalizeParentModel(ctx.model);
+		let nativeRequired: ReturnType<typeof requiredNativeProvider>;
+		if (!["doctor", "guide"].includes(params.action?.trim().toLowerCase() ?? "")) {
+			try {
+				nativeRequired = requiredNativeProvider(resolveCurrentSessionId(ctx.sessionManager));
+				if (nativeRequired && params.action && !["list", "status", "read", "validate", "resume"].includes(params.action)) throw new Error(`Required native provider does not yet support action='${params.action}'; retained hosts must not be revived or controlled through the default runner.`);
+			} catch (error) { return buildRequestedModeError(params, error instanceof Error ? error.message : String(error)); }
+		}
 		const workflowLaunchObserver = workflowLaunchObservers.get(params);
 		const inheritedUsageBudget = workflowOwnedUsageBudgets.get(params);
 		const delegatedThinkingOverride = delegatedThinkingOverrides.get(params);
@@ -4930,7 +4981,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			const workflowParentModel = parentModelOverride !== undefined
 				? parentModelOverride
 				: (() => {
-					const currentParentModel = normalizeParentModel(ctx.model);
+					const currentParentModel = entryParentModel;
 					return (preserveActiveSession
 						? currentParentModel
 						: rememberParentModel(deps.state, resolveCurrentSessionId(ctx.sessionManager), currentParentModel)) ?? null;
@@ -5967,11 +6018,11 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			requestParentModel = parentModelOverride !== undefined
 				? parentModelOverride ?? undefined
 				: preserveActiveSession
-					? normalizeParentModel(ctx.model)
-					: rememberParentModel(deps.state, requestSessionId, ctx.model);
+					? entryParentModel
+					: rememberParentModel(deps.state, requestSessionId, entryParentModel);
 		} catch (error) {
 			if (action?.toLowerCase() !== "doctor" && action?.toLowerCase() !== "guide") throw error;
-			requestParentModel = normalizeParentModel(ctx.model);
+			requestParentModel = entryParentModel;
 		}
 		if (action) {
 			if (action === "worktree.cleanup") {
@@ -6657,6 +6708,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		if ("error" in contextPolicyResult) return buildRequestedModeError(effectiveParams, contextPolicyResult.error);
 		const contextPolicy = contextPolicyResult;
 		effectiveParams = contextPolicy.params;
+		if (nativeRequired && (contextPolicy.usesFork || effectiveParams.async === false || effectiveParams.foregroundOnly || effectiveParams.clarify)) return buildRequestedModeError(effectiveParams, "Required native provider supports fresh background children only; fork, foreground-only execution and clarification are rejected, not rewritten.");
 		const sessionName = resolveIntercomSessionTarget(deps.pi.getSessionName(), ctx.sessionManager.getSessionId());
 		const intercomBridge = resolveIntercomBridge({
 			config: deps.config.intercomBridge,
@@ -6773,7 +6825,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			.map((name) => agents.find((agent) => agent.name === name))
 			.find((agent) => agent?.runner?.type === "external-cli" || agent?.runner?.type === "external-job");
 		const externalAsyncRequired = Boolean(externalAgent) && effectiveParams.async === undefined && effectiveParams.clarify !== true && effectiveParams.foregroundOnly !== true;
-		const requestedAsync = externalAsyncRequired ? true : effectiveParams.async ?? deps.asyncByDefault;
+		const requestedAsync = nativeRequired || externalAsyncRequired ? true : effectiveParams.async ?? deps.asyncByDefault;
 		const backgroundRequestedWhileClarifying = (hasChain || hasTasks) && requestedAsync && effectiveParams.clarify === true;
 		const effectiveAsync = requestedAsync && effectiveParams.clarify !== true;
 		if (externalAgent && (!effectiveAsync || effectiveParams.foregroundOnly === true)) {

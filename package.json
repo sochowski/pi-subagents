@@ -1,6 +1,7 @@
 {
   "name": "pi-subagents",
   "version": "0.66.0",
+  "wtNativeProviderContract": 1,
   "description": "Pi extension for single-agent delegation and scripted multi-agent workflows",
   "author": "Nico Bailon",
   "license": "MIT",
@@ -9,6 +10,7 @@
     ".": "./index.ts",
     "./background-work": "./src/api/background-work.ts",
     "./external-job-provider": "./src/api/external-job-provider.ts",
+    "./native-execution-provider": "./src/api/native-execution-provider.ts",
     "./external-runs": "./src/api/external-runs.ts",
     "./agents": "./src/api/agents.ts",
     "./delegation": "./src/api/delegation.ts",

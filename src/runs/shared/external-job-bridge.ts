@@ -1,3 +1,6 @@
+import { assertExternalJobProviderHandle, bindExternalJobProviderHandle, assertCurrentExternalJobCeiling, assertExternalJobProviderRequirements, assertExternalJobStartBinding, freezeExternalJobContract, readExternalJobContract, validateExternalJobLaunchRequirements } from "./external-job-contract.ts";
+import { createHash } from "node:crypto";
+import type { ExternalJobOperationContext } from "../../api/external-job-provider.ts";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -26,6 +29,7 @@ interface ExternalJobBridgeRequest {
 	operation: ExternalJobOperation;
 	provider: string;
 	providerJobId?: string;
+	context?: ExternalJobOperationContext;
 	start?: ExternalJobStartInput;
 	followUp?: ExternalJobFollowUpInput;
 	createdAt: number;
@@ -210,7 +214,7 @@ function assertRequest(value: unknown, filePath: string): ExternalJobBridgeReque
 	return request;
 }
 
-async function executeBridgeRequest(request: ExternalJobBridgeRequest, claimDir?: string): Promise<ExternalJobBridgeResponse> {
+async function executeBridgeRequest(asyncDir: string, request: ExternalJobBridgeRequest, claimDir?: string): Promise<ExternalJobBridgeResponse> {
 	const provider = getExternalJobProvider(request.provider);
 	if (!provider) {
 		return {
@@ -224,24 +228,43 @@ async function executeBridgeRequest(request: ExternalJobBridgeRequest, claimDir?
 		};
 	}
 	try {
+		const dispatch = request.operation === "start" ? request.start : request.operation === "follow-up" ? request.followUp : undefined;
+		const contract = validateExternalJobLaunchRequirements(dispatch?.launchRequirements ?? request.context?.launchRequirements);
+		if (contract.admission.provider !== request.provider || readExternalJobContract(asyncDir, contract.stepIndex).digest !== contract.digest) throw new ExternalJobProviderError("Persisted external-job requirements binding mismatch.", { code: "recovery-mismatch" });
+		if (dispatch) {
+			assertExternalJobStartBinding(contract, dispatch, request.provider);
+			if (createHash("sha256").update(dispatch.prompt).digest("hex") !== contract.promptDigest) throw new ExternalJobProviderError("External-job prompt digest mismatch.", { code: "launch-requirements-invalid" });
+			if (request.operation === "follow-up") {
+				const followUp = request.followUp!;
+				if (!contract.lineage || Object.entries(contract.lineage).some(([key, value]) => followUp[key as keyof ExternalJobFollowUpInput] !== value)) throw new ExternalJobProviderError("External-job follow-up lineage mismatch.", { code: "recovery-mismatch" });
+			} else if (contract.lineage !== null) throw new ExternalJobProviderError("Unexpected external-job start lineage.", { code: "recovery-mismatch" });
+		}
+		if (!dispatch) assertExternalJobProviderHandle(asyncDir, contract, request.providerJobId!);
+		assertCurrentExternalJobCeiling(contract);
+		assertExternalJobProviderRequirements(provider, contract.admission.requirements);
+		freezeExternalJobContract(contract);
+		const context = Object.freeze({ launchRequirements: contract });
 		let raw: ExternalJobHandle | ExternalJobResult;
 		if (request.operation === "start") {
-			raw = await provider.start(request.start!);
+			raw = await provider.start(Object.freeze(request.start!));
 		} else if (request.operation === "follow-up") {
 			if (typeof provider.followUp !== "function") {
 				throw new ExternalJobProviderError(`External-job provider '${request.provider}' does not support follow-up. Update or reload the provider package, then retry action='resume'.`, { code: "follow-up-unsupported" });
 			}
-			raw = await provider.followUp(request.followUp!);
+			raw = await provider.followUp(Object.freeze(request.followUp!));
 		} else {
 			raw = request.operation === "status"
-				? await provider.status(request.providerJobId!)
+				? await provider.status(request.providerJobId!, context)
 				: request.operation === "reattach"
-					? await provider.reattach(request.providerJobId!)
-					: await provider.result(request.providerJobId!);
+					? await provider.reattach(request.providerJobId!, context)
+					: await provider.result(request.providerJobId!, context);
 		}
 		const result = request.operation === "result"
 			? validateExternalJobResult(provider.name, raw, "External-job bridge result")
 			: validateExternalJobHandle(provider.name, raw, "External-job bridge handle");
+		if (provider.launchRequirementsVersion === 1 && result.launchRequirementsDigest !== contract.digest) throw new ExternalJobProviderError("Provider did not acknowledge the exact launch requirements digest.", { code: "launch-requirements-unacknowledged" });
+		if (request.providerJobId && result.providerJobId !== request.providerJobId) throw new ExternalJobProviderError("Provider returned a different job identity.", { code: "recovery-mismatch" });
+		if (isDispatchOperation(request.operation)) bindExternalJobProviderHandle(asyncDir, contract, result.providerJobId);
 		if (isDispatchOperation(request.operation) && claimDir) writeAtomicJson(dispatchClaimHandlePath(claimDir), result);
 		return { id: request.id, ok: true, operation: request.operation, provider: request.provider, result, completedAt: Date.now() };
 	} catch (error) {
@@ -361,7 +384,7 @@ export function serviceExternalJobBridgeRequestFile(asyncDir: string, file: stri
 	if (!claimed) return;
 	const claimedRequest = claimed.request;
 	inFlight.add(claimedRequest.id);
-	void executeBridgeRequest(claimedRequest, isDispatchOperation(claimedRequest.operation) ? claimed.filePath : undefined).then((response) => {
+	void executeBridgeRequest(asyncDir, claimedRequest, isDispatchOperation(claimedRequest.operation) ? claimed.filePath : undefined).then((response) => {
 		writeAtomicJson(responsePath(asyncDir, claimedRequest.id), response);
 		if (isDispatchOperation(claimedRequest.operation)) {
 			writeAtomicJson(dispatchClaimCompletedPath(claimed.filePath), { completedAt: Date.now() });
@@ -400,7 +423,19 @@ function serviceExternalJobDispatchClaim(asyncDir: string, file: string): void {
 		return;
 	}
 	if (!isDispatchOperation(request.operation) || fs.existsSync(responsePath(asyncDir, request.id))) return;
-	const handle = readClaimHandle(request.provider, claimDir);
+	let handle = readClaimHandle(request.provider, claimDir);
+	if (handle) {
+		try {
+			const contract = validateExternalJobLaunchRequirements(request.start?.launchRequirements ?? request.followUp?.launchRequirements);
+			if (readExternalJobContract(asyncDir, contract.stepIndex).digest !== contract.digest) throw new Error("Recovered claim contract mismatch.");
+			assertExternalJobProviderHandle(asyncDir, contract, handle.providerJobId);
+			assertCurrentExternalJobCeiling(contract);
+			const provider = getExternalJobProvider(request.provider);
+			if (!provider) throw new Error("Provider unavailable.");
+			assertExternalJobProviderRequirements(provider, contract.admission.requirements);
+			if (provider.launchRequirementsVersion === 1 && handle.launchRequirementsDigest !== contract.digest) throw new Error("Recovered handle missing acknowledgement.");
+		} catch { handle = undefined; }
+	}
 	if (handle) {
 		writeAtomicJson(responsePath(asyncDir, request.id), {
 			id: request.id,

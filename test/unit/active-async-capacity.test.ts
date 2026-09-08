@@ -461,3 +461,47 @@ describe("active async capacity", () => {
 		}
 	});
 });
+
+it("releases matching native turn tracking without claiming the retained host exited", () => {
+	const rootDir = tempRoot();
+	const asyncDir = path.join(rootDir, "runs", "native-run");
+	try {
+		const handle = acquireActiveAsyncCapacity({ sessionId: "parent", limit: 1, runId: "native-run", kind: "runner", asyncDir }, { rootDir });
+		assert.ok(handle);
+		handle.markStarted("host-turn-instance");
+		const binding = { version: 1, provider: "wt-test", ownerSessionId: "parent", parentSessionId: "parent-native", runId: "native-run", jobId: "job", turnId: "turn", configDigest: "digest" };
+		writeJson(path.join(asyncDir, "status.json"), { runId: "native-run", sessionId: "parent", mode: "single", state: "complete", startedAt: 100, nativeExecution: binding, processTerminal: { version: 1, state: "pending", runId: "native-run", runnerProcessInstanceId: "host-turn-instance" } });
+		writeJson(path.join(asyncDir, "native-execution.json"), binding);
+		const release = { ...binding, runnerProcessInstanceId: "host-turn-instance", nativeId: "native", sessionFile: path.join(rootDir, "native.jsonl"), hostRetained: true };
+		writeJson(path.join(asyncDir, "native-tracking-release.json"), { ...release, turnId: "stale" });
+		assert.equal(inspectActiveAsyncCapacityOwner({ runId: "native-run", sessionId: "parent", asyncDir }, { rootDir }).release.state, "retained");
+		writeJson(path.join(asyncDir, "native-tracking-release.json"), release);
+		const inspected = inspectActiveAsyncCapacityOwner({ runId: "native-run", sessionId: "parent", asyncDir }, { rootDir });
+		assert.equal(inspected.release.state, "releasable");
+		assert.match(inspected.release.reason, /interactive host remains retained/);
+		assert.equal(fs.existsSync(path.join(asyncDir, "process-terminal.json")), false);
+		assert.deepEqual(getActiveAsyncCapacitySnapshot("parent", 1, { rootDir }), { used: 0, limit: 1 });
+		const workflowDir = path.join(rootDir, "runs", "workflow");
+		const workflow = acquireActiveAsyncCapacity({ sessionId: "parent", limit: 1, runId: "workflow", kind: "workflow", asyncDir: workflowDir }, { rootDir });
+		assert.ok(workflow);
+		workflow.markWorkflowStarted();
+		writeJson(path.join(workflowDir, "status.json"), { runId: "workflow", sessionId: "parent", mode: "workflow", state: "complete", steps: [{ agent: "worker", workflowKey: "alpha", runId: "native-run", async: true }] });
+		assert.deepEqual(getActiveAsyncCapacitySnapshot("parent", 1, { rootDir }), { used: 0, limit: 1 });
+	} finally { fs.rmSync(rootDir, { recursive: true, force: true }); }
+});
+
+it("releases failed native pre-session capacity only for the exact settled startup instance", () => {
+	const rootDir = tempRoot();
+	const asyncDir = path.join(rootDir, "runs", "native-startup-failure");
+	try {
+		const handle = acquireActiveAsyncCapacity({ sessionId: "parent", limit: 1, runId: "native-startup-failure", kind: "runner", asyncDir }, { rootDir });
+		assert.ok(handle);
+		handle.markStarted("startup-instance");
+		const status = { runId: "native-startup-failure", sessionId: "parent", mode: "single", state: "failed", startedAt: 100, error: "Native session creation/binding failed before dispatch.", nativeExecution: { version: 1, jobId: "job", turnId: "turn" }, processTerminal: { version: 1, state: "not-started", runId: "native-startup-failure", runnerProcessInstanceId: "wrong-instance" } };
+		writeJson(path.join(asyncDir, "status.json"), status);
+		assert.equal(getActiveAsyncCapacitySnapshot("parent", 1, { rootDir }).used, 1);
+		writeJson(path.join(asyncDir, "status.json"), { ...status, processTerminal: { ...status.processTerminal, runnerProcessInstanceId: "startup-instance" } });
+		assert.equal(getActiveAsyncCapacitySnapshot("parent", 1, { rootDir }).used, 0);
+		assert.equal(fs.existsSync(path.join(asyncDir, "native-tracking-release.json")), false);
+	} finally { fs.rmSync(rootDir, { recursive: true, force: true }); }
+});

@@ -1,3 +1,6 @@
+import { assertExternalJobStartBinding, bindExternalJobLaunch, persistExternalJobContract, validateExternalJobLaunchRequirements } from "./external-job-contract.ts";
+import { stableJsonDigest } from "../../shared/launch-contract.ts";
+import type { ExternalJobAdmission, ExternalJobLaunchRequirements } from "../../api/external-job-provider.ts";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -27,9 +30,9 @@ export function externalJobStableJson(value: unknown): string {
 	return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${externalJobStableJson(record[key])}`).join(",")}}`;
 }
 
-export function externalJobFollowUpRequestDigest(input: { provider: string; parentProviderJobId: string; promptDigest: string; options: Record<string, unknown> }): string {
+export function externalJobFollowUpRequestDigest(input: { provider: string; parentProviderJobId: string; promptDigest: string; options: Record<string, unknown>; parentRequirementsDigest?: string }): string {
 	return createHash("sha256")
-		.update(externalJobStableJson({ provider: input.provider, parentProviderJobId: input.parentProviderJobId, promptDigest: input.promptDigest, options: input.options }))
+		.update(externalJobStableJson({ provider: input.provider, parentProviderJobId: input.parentProviderJobId, promptDigest: input.promptDigest, options: input.options, ...(input.parentRequirementsDigest ? { parentRequirementsDigest: input.parentRequirementsDigest } : {}) }))
 		.digest("hex");
 }
 
@@ -110,6 +113,7 @@ function parseExternalJobStatus(value: unknown, statusPath: string): ExternalJob
 	if (startedAt !== undefined && typeof startedAt !== "number") throw malformedStatus(statusPath);
 	if (updatedAt !== undefined && typeof updatedAt !== "number") throw malformedStatus(statusPath);
 	return {
+		...(value.launchRequirements !== undefined ? { launchRequirements: validateExternalJobLaunchRequirements(value.launchRequirements) } : {}),
 		provider,
 		promptDigest,
 		...(operation ? { operation } : {}),
@@ -243,6 +247,7 @@ function blocksStartRedispatch(status: ExternalJobStatus, provider: string, prom
 }
 
 interface ExternalJobFollowUpDescriptor {
+	parentRequirementsDigest: string;
 	sourceRunId: string;
 	sourceStepIndex: number;
 	parentProviderJobId: string;
@@ -261,6 +266,8 @@ function sameFollowUpLineage(status: ExternalJobStatus, followUp: ExternalJobFol
 }
 
 export async function runExternalJob(input: {
+	admission?: ExternalJobAdmission;
+	systemPrompt?: string;
 	provider: string;
 	options?: Record<string, unknown>;
 	cwd: string;
@@ -284,11 +291,13 @@ export async function runExternalJob(input: {
 	let timedOut = false;
 	let stopped = false;
 	let current: ExternalJobStatus | undefined;
+	let launchRequirements: ExternalJobLaunchRequirements | undefined;
 	const timeout = () => { timedOut = true; };
 	const stop = () => { stopped = true; };
 	input.registerTimeout?.(timeout);
 	input.registerStop?.(stop);
 	const publish = (status: ExternalJobStatus) => {
+		if (launchRequirements) status.launchRequirements = launchRequirements;
 		current = status;
 		input.onExternalJob?.(status);
 	};
@@ -301,6 +310,11 @@ export async function runExternalJob(input: {
 	};
 	try {
 		current = readExistingExternalJob(input.asyncDir, input.stepIndex);
+		launchRequirements = bindExternalJobLaunch(input.admission!, input.stepIndex, promptDigest, input.followUp ?? null);
+		assertExternalJobStartBinding(launchRequirements, { ...input, options, promptDigest }, provider);
+		if (input.admission!.systemPromptDigest !== stableJsonDigest(input.systemPrompt ?? "")) throw new ExternalJobProviderError("External-job profile prompt binding mismatch.", { code: "launch-requirements-invalid" });
+		if (current && (!current.launchRequirements || current.launchRequirements.digest !== launchRequirements.digest)) throw new ExternalJobProviderError("Missing or mismatched persisted external-job launch requirements. Refusing recovery.", { code: "recovery-mismatch" });
+		persistExternalJobContract(input.asyncDir, launchRequirements);
 		let handle: ExternalJobHandle;
 		if (current?.providerJobId) {
 			if (current.provider !== provider || current.promptDigest !== promptDigest || !sameFollowUpLineage(current, input.followUp)) {
@@ -309,7 +323,7 @@ export async function runExternalJob(input: {
 				publish(status);
 				return { output: message, exitCode: 1, error: message, externalJob: status };
 			}
-			handle = await requestExternalJobOperation<ExternalJobHandle>(input.asyncDir, { operation: "reattach", provider, providerJobId: current.providerJobId });
+			handle = await requestExternalJobOperation<ExternalJobHandle>(input.asyncDir, { operation: "reattach", provider, providerJobId: current.providerJobId, context: { launchRequirements } });
 		} else {
 			if (current && blocksStartRedispatch(current, provider, promptDigest)) {
 				const message = `External-job ${input.followUp ? "follow-up" : "start"} for provider '${provider}' previously ended without a durable provider job id. Refusing to redispatch the prompt automatically.`;
@@ -323,6 +337,7 @@ export async function runExternalJob(input: {
 					operation: "follow-up",
 					provider,
 					followUp: {
+						launchRequirements,
 						prompt: input.prompt,
 						promptDigest,
 						cwd: input.cwd,
@@ -339,6 +354,7 @@ export async function runExternalJob(input: {
 					operation: "start",
 					provider,
 					start: {
+						launchRequirements,
 						prompt: input.prompt,
 						promptDigest,
 						cwd: input.cwd,
@@ -360,10 +376,10 @@ export async function runExternalJob(input: {
 				return { output: message, exitCode: 1, error: message, ...(timedOut ? { timedOut: true } : {}), ...(stopped ? { stopped: true } : {}), externalJob: current! };
 			}
 			await sleep(STATUS_POLL_INTERVAL_MS);
-			handle = await requestExternalJobOperation<ExternalJobHandle>(input.asyncDir, { operation: "status", provider, providerJobId: handle.providerJobId });
+			handle = await requestExternalJobOperation<ExternalJobHandle>(input.asyncDir, { operation: "status", provider, providerJobId: handle.providerJobId, context: { launchRequirements } });
 			publish(statusFromHandle({ provider, promptDigest, options, followUp: input.followUp, previous: current, handle }));
 		}
-		const result = await requestExternalJobOperation<ExternalJobResult>(input.asyncDir, { operation: "result", provider, providerJobId: handle.providerJobId });
+		const result = await requestExternalJobOperation<ExternalJobResult>(input.asyncDir, { operation: "result", provider, providerJobId: handle.providerJobId, context: { launchRequirements } });
 		let artifactPath = result.artifactPath;
 		if (!artifactPath && result.output !== undefined) {
 			artifactPath = path.join(input.asyncDir, `external-job-${input.stepIndex}.result.md`);

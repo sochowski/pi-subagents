@@ -201,6 +201,7 @@ function createLeaseDirectory(leaseDir: string, owner: SessionLeaseOwner): boole
 
 export function acquireSessionLease(request: SessionLeaseRequest, options: SessionLeaseOptions = {}): SessionLeaseHandle {
 	const canonicalSessionFile = canonicalSessionFilePath(request.sessionFile);
+	if (fs.existsSync(`${canonicalSessionFile}.native-host.json`)) throw new SessionLeaseConflictError("Retained native provider owns this transcript; public continuation must route to its existing host, never acquire a second SDK writer.");
 	const rootDir = options.rootDir ?? SESSION_LEASES_DIR;
 	const leaseDir = sessionLeaseDir(canonicalSessionFile, rootDir);
 	const now = options.now ?? Date.now;

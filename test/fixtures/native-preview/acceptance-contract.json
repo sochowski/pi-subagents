@@ -1,0 +1,89 @@
+{
+  "source": "native-preview alpha 2677e666-90c5-4382-b3c9-6d80730b391f; rejected 0661983d-1fae-41b8-a7e2-75637c9c62fb. Paths/system prompt replaced; compared values and original inference task preserved.",
+  "config": {
+    "id": "original",
+    "sessionId": "owner",
+    "cwd": "/fixture/alpha",
+    "steps": [
+      {
+        "agent": "worker",
+        "model": "openai-codex/gpt-5.6-sol:high",
+        "modelCandidates": [
+          "openai-codex/gpt-5.6-sol:high"
+        ],
+        "thinking": "high",
+        "tools": [
+          "read",
+          "grep",
+          "find",
+          "ls",
+          "bash",
+          "edit",
+          "write",
+          "contact_supervisor"
+        ],
+        "inheritProjectContext": true,
+        "inheritGlobalContext": false,
+        "inheritSkills": false,
+        "skills": [],
+        "systemPromptMode": "replace",
+        "maxSubagentDepth": 2,
+        "waitToolEnabled": true,
+        "effectiveAcceptance": {
+          "level": "checked",
+          "explicit": true,
+          "inferredReason": [
+            "async write-capable or risky run"
+          ],
+          "criteria": [
+            {
+              "id": "read-marker",
+              "must": "Read the local marker.txt and report its exact contents and cwd without editing files",
+              "evidence": [
+                "changed-files",
+                "tests-added",
+                "commands-run",
+                "residual-risks",
+                "no-staged-files"
+              ],
+              "severity": "required"
+            }
+          ],
+          "evidence": [
+            "changed-files",
+            "tests-added",
+            "commands-run",
+            "residual-risks",
+            "no-staged-files"
+          ],
+          "verify": [],
+          "review": {
+            "agent": "reviewer",
+            "required": true
+          },
+          "stopRules": []
+        },
+        "acceptanceInput": {
+          "level": "checked",
+          "criteria": [
+            {
+              "id": "read-marker",
+              "must": "Read the local marker.txt and report its exact contents and cwd without editing files"
+            }
+          ],
+          "evidence": [
+            "commands-run",
+            "no-staged-files"
+          ]
+        },
+        "launchBindingTask": "Read the local marker.txt with the read tool. Run git diff --cached --quiet to verify there are no staged files. Report the exact marker contents and exact cwd in a concise checked acceptance report, including the commands run and no-staged-files evidence. Make NO changes: no progress files, no writes, no staging, no commits, no views, and no nested subagents. Stop and report any blocker.",
+        "outputMode": "inline",
+        "cwd": "/fixture/alpha",
+        "parentSessionId": "parent",
+        "context": "fresh",
+        "systemPrompt": "<active_agent name=\"worker\"/> Fixture role."
+      }
+    ]
+  },
+  "followUp": "Read marker.txt again using the read tool and run git diff --cached --quiet. Report the exact marker and cwd in a fresh checked acceptance-report for read-marker, commands-run, and no-staged-files. Do not change any files, progress, tools, model, thinking, role, context, checkout or cwd, and do not delegate."
+}

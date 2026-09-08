@@ -1,3 +1,5 @@
+import { externalJobFixture } from "../support/external-job-fixture.ts";
+import { persistExternalJobContract, bindExternalJobProviderHandle, externalJobContractPath } from "../../src/runs/shared/external-job-contract.ts";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
@@ -527,8 +529,10 @@ describe("intercom result delivery cutover", { skip: !available ? "executor not 
 		const sourceRunId = `resume-external-job-${Date.now()}`;
 		const sourceAsyncDir = path.join(ASYNC_DIR, sourceRunId);
 		const followUpMessage = "What changed after the first answer?";
+		const sourceContract = externalJobFixture({ provider: "surf-oracle", agent: "gpt-pro", sessionId: "session-123", runId: sourceRunId, stepIndex: 0, cwd: tempDir, prompt: "original prompt", options: { tier: "pro" } }).launchRequirements;
 		const requestDigest = externalJobFollowUpRequestDigest({
 			provider: "surf-oracle",
+			parentRequirementsDigest: sourceContract.digest,
 			parentProviderJobId: "job-parent",
 			promptDigest: externalJobPromptDigest(followUpMessage),
 			options: { tier: "pro" },
@@ -553,6 +557,8 @@ describe("intercom result delivery cutover", { skip: !available ? "executor not 
 		});
 		try {
 			fs.mkdirSync(sourceAsyncDir, { recursive: true });
+			persistExternalJobContract(sourceAsyncDir, sourceContract);
+			bindExternalJobProviderHandle(sourceAsyncDir, sourceContract, "job-parent");
 			fs.writeFileSync(path.join(sourceAsyncDir, "status.json"), JSON.stringify({
 				runId: sourceRunId,
 				sessionId: "session-123",
@@ -565,7 +571,7 @@ describe("intercom result delivery cutover", { skip: !available ? "executor not 
 					agent: "gpt-pro",
 					status: "complete",
 					runner: { type: "external-job", provider: "surf-oracle", options: { tier: "pro" }, capabilities: { stop: false, steer: false, resume: false, structuredOutput: false, toolEvents: false } },
-					externalJob: { provider: "surf-oracle", providerJobId: "job-parent", promptDigest: externalJobPromptDigest("original prompt"), options: { tier: "pro" }, state: "completed" },
+					externalJob: { launchRequirements: sourceContract, provider: "surf-oracle", providerJobId: "job-parent", promptDigest: externalJobPromptDigest("original prompt"), options: { tier: "pro" }, state: "completed" },
 				}],
 			}, null, 2), "utf-8");
 			const { executor } = makeExecutor({ agents: [makeAgent("gpt-pro", { runner: { type: "external-job", provider: "surf-oracle", options: { tier: "pro" } } })] });
@@ -574,6 +580,11 @@ describe("intercom result delivery cutover", { skip: !available ? "executor not 
 			assert.equal(first.isError, undefined, first.content[0]?.text ?? "follow-up failed");
 			assert.equal(first.details?.asyncId, expectedRunId);
 
+			const admissionDeadline = Date.now() + 10_000;
+			while (!fs.existsSync(externalJobContractPath(continuationAsyncDir, 0))) {
+				if (Date.now() > admissionDeadline) assert.fail("Timed out waiting for admitted continuation contract");
+				await new Promise((resolve) => setTimeout(resolve, 20));
+			}
 			const duplicate = await executor.execute("resume-external-job-duplicate", { action: "resume", id: sourceRunId, message: followUpMessage }, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
 			assert.equal(duplicate.isError, undefined, duplicate.content[0]?.text ?? "duplicate failed");
 			assert.equal(duplicate.details?.asyncId, expectedRunId);
@@ -607,8 +618,10 @@ describe("intercom result delivery cutover", { skip: !available ? "executor not 
 		const sourceRunId = `resume-external-job-multi-${Date.now()}`;
 		const sourceAsyncDir = path.join(ASYNC_DIR, sourceRunId);
 		const followUpMessage = "Continue the selected advisor";
+		const sourceContract = externalJobFixture({ provider: "surf-oracle", agent: "gpt-pro", sessionId: "session-123", runId: sourceRunId, stepIndex: 1, cwd: tempDir, prompt: "original prompt", options: { tier: "pro" } }).launchRequirements;
 		const requestDigest = externalJobFollowUpRequestDigest({
 			provider: "surf-oracle",
+			parentRequirementsDigest: sourceContract.digest,
 			parentProviderJobId: "job-second",
 			promptDigest: externalJobPromptDigest(followUpMessage),
 			options: { tier: "pro" },
@@ -631,6 +644,8 @@ describe("intercom result delivery cutover", { skip: !available ? "executor not 
 		});
 		try {
 			fs.mkdirSync(sourceAsyncDir, { recursive: true });
+			persistExternalJobContract(sourceAsyncDir, sourceContract);
+			bindExternalJobProviderHandle(sourceAsyncDir, sourceContract, "job-second");
 			fs.writeFileSync(path.join(sourceAsyncDir, "status.json"), JSON.stringify({
 				runId: sourceRunId,
 				sessionId: "session-123",
@@ -646,7 +661,7 @@ describe("intercom result delivery cutover", { skip: !available ? "executor not 
 					agent: "gpt-pro",
 					status: "complete",
 					runner: { type: "external-job", provider: "surf-oracle", options: { tier: "pro" }, capabilities: { stop: false, steer: false, resume: false, structuredOutput: false, toolEvents: false } },
-					externalJob: { provider: "surf-oracle", providerJobId: "job-second", promptDigest: externalJobPromptDigest("original prompt"), options: { tier: "pro" }, state: "completed" },
+					externalJob: { launchRequirements: sourceContract, provider: "surf-oracle", providerJobId: "job-second", promptDigest: externalJobPromptDigest("original prompt"), options: { tier: "pro" }, state: "completed" },
 				}],
 			}, null, 2), "utf-8");
 			const { executor } = makeExecutor({ agents: [makeAgent("gpt-pro", { runner: { type: "external-job", provider: "surf-oracle", options: { tier: "pro" } } })] });

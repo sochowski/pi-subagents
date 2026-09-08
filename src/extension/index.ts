@@ -12,6 +12,7 @@
  *   { "asyncByDefault": true, "defaultSubagentContext": "fork", "forkContext": { "mode": "pruned", "model": "provider/model" }, "forceTopLevelAsync": true, "maxSubagentDepth": 1, "intercomBridge": { "mode": "always", "instructionFile": "./intercom-bridge.md" }, "worktreeSetupHook": "./scripts/setup-worktree.mjs" }
  */
 
+import { registerNativeExecutionProviderListener } from "../api/native-execution-provider.ts";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -873,6 +874,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	};
 	const eventUnsubscribes = [
 		registerRuntimeAgentEventListener(pi),
+		registerNativeExecutionProviderListener(pi, () => state.currentSessionId && state.supervisorOwnerSessionId ? { ownerSessionId: state.currentSessionId, parentSessionId: state.supervisorOwnerSessionId } : undefined),
 		pi.events.on(SUBAGENT_ASYNC_STARTED_EVENT, asyncStartedHandler),
 		pi.events.on(SUBAGENT_ASYNC_COMPLETE_EVENT, asyncCompleteHandler),
 		pi.events.on(SUBAGENT_PROCESS_TERMINAL_EVENT, () => {

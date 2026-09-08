@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import { nativePublicationOutcome } from "./native-runner-route.ts";
 import * as path from "node:path";
 import { writeAtomicJson } from "../../shared/atomic-json.ts";
 import { resultFilePath, resultPayloadPathForSessionRun, writeAsyncResultFile } from "./result-files.ts";
@@ -386,6 +387,20 @@ export function reconcileAsyncRun(asyncDir: string, options: ReconcileAsyncRunOp
 	}
 	if (effectiveStatus.displayDismissedAt !== undefined) {
 		return { status: null, repaired: false, resultPath };
+	}
+
+	if (effectiveStatus.nativeExecution && effectiveStatus.state === "running") {
+		const publication = nativePublicationOutcome(asyncDir, effectiveStatus.nativeExecution);
+		if (publication?.publication === "not-published" && publication.runnerProcessInstanceId) {
+			const failed: AsyncStatus = { ...effectiveStatus, state: "failed", lastUpdate: now, error: "Native continuation was definitely not published; matching queued WT turn was settled.", processTerminal: { version: 1, state: "not-started", runId, runnerProcessInstanceId: publication.runnerProcessInstanceId } };
+			writeAtomicJson(path.join(asyncDir, "status.json"), failed);
+			updateActiveRunIndex(asyncDir, failed.state, failed.toolCallId);
+			return { status: failed, repaired: true, resultPath, message: failed.error };
+		}
+		if (publication?.publication === "uncertain") {
+			const message = "Native continuation publication is uncertain. Inspect the recorded owner/job/turn and retained host; never replay or infer definite failure from PID liveness.";
+			return { status: effectiveStatus, repaired: false, resultPath, message };
+		}
 	}
 
 	if (effectiveStatus.state !== "running" || typeof effectiveStatus.pid !== "number") {

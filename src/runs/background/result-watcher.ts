@@ -1,4 +1,6 @@
 import * as fs from "node:fs";
+import { Check } from "typebox/value";
+import { formatNativeHumanIntervention, nativeHumanInterventionEffectsSchema, projectNativeHumanIntervention } from "../shared/native-human-intervention.ts";
 import * as path from "node:path";
 import { buildCompletionKey, markSeenWithTtl } from "./completion-dedupe.ts";
 import { createFileCoalescer } from "../../shared/file-coalescer.ts";
@@ -66,6 +68,7 @@ type ResultWatcherDeps = {
 };
 
 type ResultFileChild = {
+	effects?: unknown;
 	agent?: string;
 	sessionName?: string;
 	output?: string;
@@ -464,6 +467,11 @@ export function createResultWatcher(
 			const resultChildren: ResultFileChild[] = hasResultChildren
 				? data.results!
 				: [{ agent: data.agent ?? undefined, output: data.summary, outputState: "unknown", success: data.success }];
+			const humanInterventionNotices = resultChildren.map((result, index) => {
+				const intervention = Check(nativeHumanInterventionEffectsSchema, result.effects) ? projectNativeHumanIntervention(result.effects.humanIntervention) : undefined;
+				const notice = formatNativeHumanIntervention(intervention);
+				return notice ? `Step ${index + 1}: ${notice}` : "";
+			});
 			const normalizedChildren = attachNestedChildrenToResultChildren(runId, resultChildren.map((result = {}, index): SubagentResultIntercomChild => {
 				const baseOutput = hasResultChildren ? result.output : result.output ?? data.summary;
 				const hasRealOutput = typeof baseOutput === "string" && baseOutput.trim().length > 0;
@@ -496,7 +504,7 @@ export function createResultWatcher(
 					outputState: result.outputState === "present" || result.outputState === "absent" || result.outputState === "unknown"
 						? result.outputState
 						: "unknown",
-					summary,
+					summary: [humanInterventionNotices[index], summary].filter(Boolean).join("\n\n"),
 					index,
 					artifactPath: result.artifactPaths?.outputPath,
 					...(typeof sessionPath === "string" && fsApi.existsSync(sessionPath) ? { sessionPath } : {}),
@@ -539,6 +547,7 @@ export function createResultWatcher(
 
 			const accepted = await notifier.deliver({
 				...data,
+				summary: humanInterventionNotices.some(Boolean) ? [...humanInterventionNotices, data.summary].filter(Boolean).join("\n\n") : data.summary,
 				id: data.id ?? runId,
 				runId,
 				triggerTurn,

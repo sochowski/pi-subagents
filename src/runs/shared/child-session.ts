@@ -8,6 +8,8 @@
  * `createAgentSession` from a pi package module and shares one `ModelRuntime`
  * across every child it creates.
  */
+import * as fs from "node:fs";
+import { assertDefaultNativeLaunchAllowed } from "../../api/native-execution-provider.ts";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "../../shared/utils.ts";
@@ -96,7 +98,13 @@ export interface ChildSession {
 	readonly messages: readonly AgentMessage[];
 	readonly sessionFile: string | undefined;
 	readonly sessionId: string;
+	/** Exact native checkpoint from the sole SDK writer. */
+	readonly nativeLeaf?: string | null;
+	readonly humanIntervention?: import("../../shared/types.ts").NativeHumanIntervention;
+	/** Native prompt settlement owns completion while queued/steered work runs. */
+	readonly hasPendingNativeWork?: boolean;
 	readonly modelId: string | undefined;
+	readonly thinkingLevel?: string;
 	/** Set by the foreground host once the run detached; `factory.dispose()` leaves such children running. */
 	detached?: boolean;
 	/** Set by `factory.dispose()` before it aborts the child, so the host can report the stop truthfully. */
@@ -118,6 +126,10 @@ export interface DefaultChildSessionFactoryOptions {
 	 * installed package by absolute path.
 	 */
 	loadPiCodingAgent?: () => Promise<PiCodingAgentModule>;
+	/** Package-owned host binding. Runs on the same SDK session; never opens its transcript again. */
+	sessionHost?: (pi: PiCodingAgentModule, result: import("@earendil-works/pi-coding-agent").CreateAgentSessionResult, services: import("@earendil-works/pi-coding-agent").AgentSessionServices) => Promise<void>;
+	/** A retained host owns shutdown; attempt disposal only releases tracking. */
+	retainSession?: boolean;
 	/** Upper bound on a disposed child's `session_shutdown` handlers before the session is dropped anyway. */
 	shutdownTimeoutMs?: number;
 }
@@ -193,6 +205,8 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 	};
 	return {
 		async create(launch) {
+			if (!options.sessionHost) assertDefaultNativeLaunchAllowed(launch.runtime.parentSessionId);
+			if (launch.storage.kind === "file" && fs.existsSync(`${launch.storage.sessionFile}.native-host.json`)) throw new Error("This transcript belongs to a retained native host; opening a second SDK writer is forbidden.");
 			const observeReadonly = prepareReadonlySessionEvidence(launch);
 			const pi = await loadPiCodingAgent();
 			const modelRuntime = await sharedRuntime(pi);
@@ -222,6 +236,8 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 				await flushQueuedProviderRegistrations(loader, modelRuntime, launch.onExtensionError);
 				// No await between receipt validation and the SDK's permissive file open.
 				observeReadonly?.beforeOpen();
+				if (launch.storage.kind === "file" && fs.existsSync(`${launch.storage.sessionFile}.native-host.json`)) throw new Error("Native ownership appeared during loading; a second SDK writer is forbidden.");
+				if (options.sessionHost && launch.storage.kind === "file" && fs.existsSync(launch.storage.sessionFile)) throw new Error("Native fresh transcript appeared before creation; refusing to reopen another writer's file.");
 				const sessionManager = launch.storage.kind === "file"
 					? pi.SessionManager.open(launch.storage.sessionFile, undefined, launch.cwd)
 					: launch.storage.kind === "dir"
@@ -234,7 +250,7 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 					? pi.resolveCliModel({ cliModel: launch.model, modelRuntime })
 					: undefined;
 				if (resolvedModel?.error) throw new Error(resolvedModel.error);
-				const { session } = await pi.createAgentSession({
+				const created = await pi.createAgentSession({
 					cwd: launch.cwd,
 					agentDir,
 					modelRuntime,
@@ -247,11 +263,16 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 					settingsManager,
 					sessionStartEvent: { type: "session_start", reason: "startup" },
 				});
+				const { session } = created;
 				try {
-					await session.bindExtensions({
-						mode: "print",
-						onError: (error) => launch.onExtensionError?.({ extensionPath: error.extensionPath, event: error.event, error: error.error }),
-					});
+					if (options.sessionHost) {
+						await options.sessionHost(pi, created, { cwd: launch.cwd, agentDir, modelRuntime, settingsManager, resourceLoader: loader, diagnostics: [] });
+					} else {
+						await session.bindExtensions({
+							mode: "print",
+							onError: (error) => launch.onExtensionError?.({ extensionPath: error.extensionPath, event: error.event, error: error.error }),
+						});
+					}
 				} catch (error) {
 					session.dispose();
 					throw error;
@@ -287,7 +308,7 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 			const child: ChildSession = {
 				subscribe: (listener) => session.subscribe((event) => listener(event as unknown as ChildSessionEvent)),
 				prompt: (text) => {
-					if (!evidence) return session.prompt(text);
+					if (!evidence) return session.prompt(text, options.sessionHost ? { source: "extension" } : undefined);
 					try { evidence.start(); } catch (error) { return Promise.reject(error); }
 					return session.prompt(text).then(() => evidence?.settled(), (error) => { evidence?.invalidate(); throw error; });
 				},
@@ -295,6 +316,7 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 				followUp: (text) => { evidence?.invalidate(); return session.followUp(text); },
 				abort: () => { evidence?.invalidate(); return session.abort(); },
 				dispose: () => {
+					if (options.retainSession) return Promise.resolve();
 					if (!pending) {
 						live.delete(child);
 						const shutdownDone = shutdown();
@@ -307,7 +329,9 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 				get messages() { return session.messages; },
 				get sessionFile() { return session.sessionFile; },
 				get sessionId() { return session.sessionId; },
+				get nativeLeaf() { return session.sessionManager.getLeafId(); },
 				get modelId() { return session.model ? `${session.model.provider}/${session.model.id}` : undefined; },
+				get thinkingLevel() { return session.thinkingLevel; },
 			};
 			if (evidence && session.model) readonlyModels.set(child, {
 				current: toModelInfo(session.model),
@@ -323,6 +347,7 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 			return child;
 		},
 		async dispose() {
+			if (options.retainSession) return;
 			const children = [...live].filter((child) => !child.detached);
 			for (const child of children) child.shutDown = true;
 			await Promise.allSettled(children.map((child) => child.abort()));

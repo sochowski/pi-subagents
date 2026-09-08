@@ -67,6 +67,32 @@ async function waitForPredicate(predicate: () => boolean, timeoutMs = 2_500): Pr
 }
 
 describe("result watcher", () => {
+	it("reveals native human intervention in parent notification and consumed completion", async () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-human-intervention-"));
+		const state = createState();
+		state.currentSessionId = "human-parent";
+		const humanIntervention = { source: "interactive", accepted: 1, delivered: 1, firstAcceptedAt: 10, lastAcceptedAt: 20 };
+		let summary: string | undefined;
+		const watcher = createResultWatcher({ events: { on: () => () => {}, emit() {} } }, state, resultsDir, 60_000, {
+			deliverIntercomResults: false,
+			notifier: { async deliver(result) { summary = result.summary; return true; } },
+		});
+		try {
+			writeIndexedResult(path.join(resultsDir, "human-run.json"), {
+				id: "human-run", runId: "human-run", sessionId: "human-parent", success: true, state: "complete", summary: "delegated result",
+				results: [{ agent: "reviewer", success: true, output: "delegated result", effects: { humanIntervention } }],
+			});
+			watcher.primeExistingResults();
+			assert.equal(await waitForPredicate(() => summary !== undefined), true);
+			assert.match(summary!, /Human intervention: 1 accepted, 1 delivered.*not an untouched delegation/);
+			assert.match(summary!, /delegated result/);
+			assert.deepEqual(state.completedResults?.get("human-run")?.completion.results?.[0]?.effects, { humanIntervention });
+		} finally {
+			watcher.stopResultWatcher();
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
 	it("does not create Darwin native watchers or idle timers", () => {
 		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-darwin-idle-"));
 		try {

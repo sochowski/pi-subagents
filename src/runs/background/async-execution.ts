@@ -1,3 +1,6 @@
+import { requiredNativeProvider, REQUIRED_NATIVE_PROVIDER_ENV } from "../../api/native-execution-provider.ts";
+import { prepareNativeRunner, nativeContinuationAcceptanceTask } from "./native-runner-route.ts";
+import { admitExternalJob, externalJobUnsupportedFeatures } from "../shared/external-job-contract.ts";
 /**
  * Async execution logic for subagent tool
  */
@@ -217,6 +220,9 @@ interface AsyncChainParams {
 }
 
 interface AsyncSingleParams {
+	nativeContinuation?: import("../../api/native-execution-provider.ts").NativeExecutionBinding;
+	/** Current declared role identity verified by public native resume, before recovery overrides. */
+	nativeDefinitionDigest?: string;
 	agent: string;
 	task?: string;
 	/** Raw caller-facing goal used only by the started event. */
@@ -286,10 +292,12 @@ interface AsyncSingleParams {
 	lane?: WorkflowLaneMetadata;
 	workflowAwaitAsync?: boolean;
 	activeAsyncCapacity?: ActiveAsyncCapacityHandle;
+	externalJobInheritedRequirements?: import("../../api/external-job-provider.ts").ExternalJobLaunchRequirements;
 	externalJobFollowUp?: {
 		sourceRunId: string;
 		sourceStepIndex: number;
 		parentProviderJobId: string;
+		parentRequirementsDigest: string;
 		requestId: string;
 		requestDigest: string;
 	};
@@ -538,7 +546,7 @@ export function emitProcessTerminalEvent(ctx: AsyncExecutionContext, proof: unkn
 	}
 }
 
-function spawnRunner(cfg: object, suffix: string, cwd: string, initialStatus: Omit<AsyncStatus, "pid" | "processTerminal">, initialStatusPath: string, onProcessTerminal?: (proof: unknown) => void, onBeforeProceed?: (runnerProcessInstanceId: string) => void, requestedCwd = cwd): SpawnRunnerResult {
+export function spawnRunner(cfg: object, suffix: string, cwd: string, initialStatus: Omit<AsyncStatus, "pid" | "processTerminal">, initialStatusPath: string, onProcessTerminal?: (proof: unknown) => void, onBeforeProceed?: (runnerProcessInstanceId: string) => void, requestedCwd = cwd): SpawnRunnerResult {
 	const cwdError = preflightLaunchCwd(requestedCwd, cwd);
 	if (cwdError) return { error: cwdError };
 
@@ -558,8 +566,16 @@ function spawnRunner(cfg: object, suffix: string, cwd: string, initialStatus: Om
 	const runnerProcessInstanceId = randomUUID();
 	const hasRevivalLease = typeof (cfg as { revivalLease?: unknown }).revivalLease === "object";
 	const launchBarrierToken = hasRevivalLease ? undefined : runnerProcessInstanceId;
-	const launchConfig = { ...cfg, runnerProcessInstanceId, ...(launchBarrierToken ? { launchBarrierToken } : {}) };
-	writePrivateAtomicJson(cfgPath, launchConfig);
+	// Admission consumes the already resolved native runner data, before any process is spawned.
+	const nativeExecution = prepareNativeRunner(cfg as Record<string, unknown>);
+	const launchConfig = { ...cfg, ...(nativeExecution ? { nativeExecution } : {}), runnerProcessInstanceId, ...(launchBarrierToken ? { launchBarrierToken } : {}) };
+	if (!nativeExecution?.previousTurnId) {
+		try { writePrivateAtomicJson(cfgPath, launchConfig); }
+		catch (error) {
+			if (nativeExecution) requiredNativeProvider(nativeExecution.ownerSessionId)?.provider.cancelPrepared?.(nativeExecution, String(error));
+			throw error;
+		}
+	}
 	const runner = path.join(path.dirname(fileURLToPath(import.meta.url)), "subagent-runner.ts");
 	const nodeCommand = resolveNodeExecutable();
 	const launchForStartup = launchConfig as typeof launchConfig & { asyncDir?: unknown; id?: unknown; sessionId?: unknown; completionOwnerId?: unknown; revivalLease?: unknown };
@@ -577,6 +593,57 @@ function spawnRunner(cfg: object, suffix: string, cwd: string, initialStatus: Om
 	if (startupPath) fs.rmSync(startupPath, { force: true });
 	if (startupAckPath) fs.rmSync(startupAckPath, { force: true });
 	if (startupProceedPath) fs.rmSync(startupProceedPath, { force: true });
+
+	if (nativeExecution) {
+		const required = requiredNativeProvider(nativeExecution.ownerSessionId);
+		if (!required || required.provider.name !== nativeExecution.provider) return { error: "Required native provider changed after admission; no fallback is permitted." };
+		if (!launchAsyncDir || !startupProceedPath || !launchBarrierToken) return { error: "Native host requires a fresh runner startup barrier." };
+		const preload = hostPeerAliases.supplemental.length > 0 ? ["--import", new URL("../../../runner-server-preload.mjs", import.meta.url).href] : [];
+		if (nativeExecution.previousTurnId) {
+			const previous = (cfg as { nativeContinuation?: import("../../api/native-execution-provider.ts").NativeExecutionBinding }).nativeContinuation;
+			if (!previous?.controlPath || !required.provider.continue) throw new Error("Native continuation control route is unavailable.");
+			const publicationPath = path.join(launchAsyncDir, "native-publication.json");
+			try {
+				writePrivateAtomicJson(path.join(launchAsyncDir, "native-execution.json"), nativeExecution);
+				writePrivateAtomicJson(path.join(launchAsyncDir, "native-runner.json"), launchConfig);
+				// Persist exact host/turn ownership BEFORE crossing the publication boundary.
+				// A crash or thrown provider call is uncertain, never an ownerless run.
+				writePrivateAtomicJson(initialStatusPath, { ...initialStatus, pid: nativeExecution.hostPid, nativeExecution });
+				writePrivateAtomicJson(publicationPath, { ...nativeExecution, runnerProcessInstanceId, publication: "uncertain" });
+				onBeforeProceed?.(runnerProcessInstanceId);
+			} catch (error) {
+				if (!required.provider.cancelPrepared) throw error;
+				required.provider.cancelPrepared(nativeExecution, String(error));
+				writePrivateAtomicJson(initialStatusPath, { ...initialStatus, state: "failed", lastUpdate: Date.now(), nativeExecution, error: String(error), processTerminal: { version: 1, state: "not-started", runId: nativeExecution.runId, runnerProcessInstanceId } });
+				return { error: String(error), runnerProcessInstanceId, startupDidNotProceed: true };
+			}
+			let continued;
+			try { continued = required.provider.continue({ binding: nativeExecution, config: launchConfig }); }
+			catch (error) { return { error: `Native continuation publication uncertain; inspect its exact host/turn, never replay: ${String(error)}`, pid: nativeExecution.hostPid, runnerProcessInstanceId }; }
+			if (continued.pid !== nativeExecution.hostPid) return { error: "Native continuation returned a different host PID; publication is uncertain, never replay.", pid: nativeExecution.hostPid, runnerProcessInstanceId };
+			writePrivateAtomicJson(publicationPath, { ...nativeExecution, runnerProcessInstanceId, ...continued, publication: continued.publication ?? "published" });
+			if (continued.publication === "not-published") {
+				writePrivateAtomicJson(initialStatusPath, { ...initialStatus, state: "failed", endedAt: Date.now(), lastUpdate: Date.now(), nativeExecution, error: continued.error ?? "Native continuation was not published.", processTerminal: { version: 1, state: "not-started", runId: nativeExecution.runId, runnerProcessInstanceId } });
+				return { error: continued.error ?? "Native continuation was not published.", runnerProcessInstanceId, startupDidNotProceed: true };
+			}
+			if (continued.publication === "uncertain") return { error: `Native continuation publication uncertain; never replay: ${continued.error}`, pid: continued.pid, runnerProcessInstanceId };
+			fs.rmSync(cfgPath, { force: true });
+			return { pid: continued.pid, runnerProcessInstanceId };
+		}
+		writePrivateAtomicJson(path.join(launchAsyncDir, "native-runner.json"), launchConfig);
+		const launched = required.provider.launch({
+			binding: nativeExecution, command: nodeCommand, args: [...preload, jitiCliPath, runner, cfgPath], cwd,
+			env: { ...omitExtensionBindingsEnv(process.env), [PI_CODING_AGENT_PACKAGE_ROOT_ENV]: piPackageRoot, [JITI_ALIAS_ENV]: JSON.stringify(hostPeerAliases.aliases), [REQUIRED_NATIVE_PROVIDER_ENV]: nativeExecution.provider },
+		});
+		if (!Number.isSafeInteger(launched.pid) || launched.pid <= 0) return { error: "Native provider did not return a live host pid; no fallback is permitted." };
+		// The retained host is not a process-terminal observation. Never forge a
+		// child_process close event when only subagent tracking has completed.
+		writePrivateAtomicJson(initialStatusPath, { ...initialStatus, pid: launched.pid, nativeExecution });
+		writePrivateAtomicJson(path.join(launchAsyncDir, "native-execution.json"), nativeExecution);
+		onBeforeProceed?.(runnerProcessInstanceId);
+		writeRunnerStartupControl(startupProceedPath, { action: "proceed", token: launchBarrierToken });
+		return { pid: launched.pid, runnerProcessInstanceId };
+	}
 
 	const logPaths = resolveAsyncRunnerLogPaths(launchConfig);
 	let stdoutFd: number | undefined;
@@ -842,7 +909,17 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 		const a = agents.find((x) => x.name === s.agent)!;
 		const externalRunner = a.runner?.type === "external-cli" || a.runner?.type === "external-job";
 		const externalRunnerType = a.runner?.type;
-		if (externalRunner) {
+		if (a.runner?.type === "external-job") {
+			const unsupported = externalJobUnsupportedFeatures(a, {
+				model: s.model, thinking: flatIndex === undefined ? undefined : thinkingOverridesByFlatIndex?.[flatIndex],
+				thinkingCeiling: params.thinkingCeiling ?? ctx.childRuntime?.thinkingCeiling,
+				skills: s.skill, schema: s.outputSchema, acceptance: s.acceptance,
+				contract: s.agentContract ?? params.agentContract, budget: s.toolBudget ?? params.toolBudget ?? params.configToolBudget,
+				fast: s.fast ?? params.fast, context: params.contextForAgent?.(s.agent), permissions: ctx.permissions,
+				worktree: s.worktree,
+			});
+			if (unsupported.length) throw new AsyncStartValidationError(`Agent '${a.name}' uses runner.type='external-job' and does not support: ${unsupported.join(", ")}.`);
+		} else if (externalRunner) {
 			const unsupported: string[] = [];
 			if (s.model !== undefined) unsupported.push("model override");
 			if (s.outputSchema !== undefined) unsupported.push("structured output");
@@ -882,6 +959,9 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 			resolvedBehavior,
 		});
 		const { stepCwd, instructionCwd, readExistenceCwd, behavior, namespaceOutputPath, outputPath, skillNames } = launchPlan;
+		if (a.runner?.type === "external-job" && skillNames.length > 0) {
+			throw new AsyncStartValidationError(`Agent '${a.name}' uses runner.type='external-job' and does not support: skills.`);
+		}
 		const { resolved: resolvedSkills, missing: missingSkills } = resolveSkillsWithFallback(
 			skillNames,
 			stepCwd,
@@ -976,7 +1056,7 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 			fast,
 			model,
 			modelCandidates,
-			capabilityCeiling: params.capabilityCeiling,
+			capabilityCeiling: intersectSubagentCapabilityCeilings(params.capabilityCeiling ?? resolveCurrentSubagentCapabilityCeiling(ctx.currentSessionId), resolveCurrentSubagentCapabilityCeiling(ctx.parentSessionId)),
 			inheritedCapabilityCeiling: ctx.childRuntime?.capabilityCeiling,
 			agentName: a.name,
 			permissionRules,
@@ -1000,7 +1080,12 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 			});
 			if (contractError) throw new AsyncStartValidationError(contractError);
 		}
+		let externalJobAdmission;
+		try {
+			externalJobAdmission = a.runner?.type === "external-job" ? admitExternalJob({ agent: a, plan: toolPlan, ownerSessionId: ctx.currentSessionId, parentSessionId: ctx.parentSessionId, runId: id, cwd: stepCwd, systemPrompt }) : undefined;
+		} catch (error) { throw new AsyncStartValidationError(error instanceof Error ? error.message : String(error)); }
 		return {
+			...(externalJobAdmission ? { externalJobAdmission } : {}),
 			parentSessionId: ctx.parentSessionId ?? ctx.currentSessionId,
 			permissionRules,
 			...(params.capabilityCeiling ? { capabilityCeiling: params.capabilityCeiling } : {}),
@@ -1590,7 +1675,15 @@ export function executeAsyncSingle(
 	const externalRunner = agentConfig.runner?.type === "external-cli" || agentConfig.runner?.type === "external-job";
 	const externalRunnerType = agentConfig.runner?.type;
 	const permissionRules = resolvePermissionRules(ctx.permissions, agentConfig.permissions);
-	if (externalRunner) {
+	if (agentConfig.runner?.type === "external-job") {
+		const unsupported = externalJobUnsupportedFeatures(agentConfig, {
+			model: params.modelOverride, thinking: params.thinkingOverride, thinkingCeiling: params.thinkingCeiling ?? ctx.childRuntime?.thinkingCeiling,
+			skills: params.skills, schema: params.structuredOutputSchema, acceptance: params.acceptance, contract: params.agentContract,
+			budget: params.toolBudget ?? params.configToolBudget, fast: params.fast, context: params.context, permissions: permissionRules,
+			extensionBindings, worktree: params.worktree,
+		});
+		if (unsupported.length) return formatAsyncStartError("single", `Agent '${agentConfig.name}' uses runner.type='external-job' and does not support: ${unsupported.join(", ")}.`);
+	} else if (externalRunner) {
 		const unsupported: string[] = [];
 		if (params.modelOverride !== undefined) unsupported.push("model override");
 		if ((params.fast ?? agentConfig.fast) === true) unsupported.push("fast mode");
@@ -1604,7 +1697,7 @@ export function executeAsyncSingle(
 		if (extensionBindings !== undefined) unsupported.push("extension bindings");
 		if (unsupported.length > 0) return formatAsyncStartError("single", `Agent '${agentConfig.name}' uses runner.type='${externalRunnerType}' and does not support: ${unsupported.join(", ")}.`);
 	}
-	const capabilityCeiling = intersectSubagentCapabilityCeilings(params.capabilityCeiling ?? resolveCurrentSubagentCapabilityCeiling(ctx.currentSessionId), ctx.childRuntime?.capabilityCeiling);
+	const capabilityCeiling = intersectSubagentCapabilityCeilings(params.capabilityCeiling ?? resolveCurrentSubagentCapabilityCeiling(ctx.currentSessionId), ctx.childRuntime?.capabilityCeiling, resolveCurrentSubagentCapabilityCeiling(ctx.parentSessionId));
 	try {
 		assertAgentAllowedByCapabilityCeiling(agentConfig.name, capabilityCeiling);
 	} catch (error) {
@@ -1793,9 +1886,34 @@ export function executeAsyncSingle(
 		});
 		if (contractError) return formatAsyncStartError("single", contractError);
 	}
+	let externalJobAdmission;
+	try {
+		externalJobAdmission = agentConfig.runner?.type === "external-job" ? admitExternalJob({ agent: agentConfig, plan: toolPlan, ownerSessionId: ctx.currentSessionId, parentSessionId: ctx.parentSessionId, runId: id, cwd: runnerCwd, systemPrompt, inherited: params.externalJobInheritedRequirements }) : undefined;
+	} catch (error) { return formatAsyncStartError("single", error instanceof Error ? error.message : String(error)); }
+	// Retained continuation keeps the original task's acceptance inference. The
+	// follow-up wording must not silently remove an admitted review requirement.
+	let launchBindingTask: string;
+	let resolvedAcceptance: ReturnType<typeof resolveEffectiveAcceptance>;
+	try {
+		if (params.nativeContinuation && !params.nativeDefinitionDigest) throw new Error("Native continuation requires a verified declared role identity.");
+		launchBindingTask = nativeContinuationAcceptanceTask(params.nativeContinuation, task);
+		resolvedAcceptance = resolveEffectiveAcceptance({
+			explicit: params.acceptance,
+			agentName: agent,
+			acceptanceRole: agentConfig.acceptanceRole,
+			task: launchBindingTask,
+			mode: "single",
+			async: true,
+			agentContract: params.agentContract,
+		});
+	} catch (error) {
+		params.activeAsyncCapacity?.rollback();
+		return formatAsyncStartError("single", `Native acceptance admission failed: ${String(error)}`);
+	}
+	const recoveryAgentConfig = params.recoveryAgentConfig ?? agentConfig;
 	const launchContractDigest = launchBindingDigest({
 		definitionDigest: agentDefinitionDigest(agentConfig),
-		task,
+		task: launchBindingTask,
 		...(model ? { model } : {}),
 		modelCandidates,
 		...((params.fast ?? agentConfig.fast) !== undefined ? { fast: params.fast ?? agentConfig.fast } : {}),
@@ -1816,16 +1934,7 @@ export function executeAsyncSingle(
 		...(params.structuredOutputSchema ? { structuredOutputSchema: params.structuredOutputSchema } : {}),
 		...(extensionBindings ? { extensionBindings } : {}),
 	});
-	const resolvedAcceptance = resolveEffectiveAcceptance({
-		explicit: params.acceptance,
-		agentName: agent,
-		acceptanceRole: agentConfig.acceptanceRole,
-		task,
-		mode: "single",
-		async: true,
-		agentContract: params.agentContract,
-	});
-	const recoveryAgentConfig = params.recoveryAgentConfig ?? agentConfig;
+
 	const recoveryDescriptor: SteeringRecoveryDescriptor = {
 		...(ctx.modelResponseAliases ? { modelResponseAliases: ctx.modelResponseAliases } : {}),
 		version: 1,
@@ -1898,6 +2007,7 @@ export function executeAsyncSingle(
 				id,
 				steps: [
 					{
+						...(externalJobAdmission ? { externalJobAdmission } : {}),
 						parentSessionId: ctx.parentSessionId ?? ctx.currentSessionId,
 						permissionRules,
 						...(capabilityCeiling ? { capabilityCeiling } : {}),
@@ -1939,8 +2049,9 @@ export function executeAsyncSingle(
 						waitToolEnabled: params.waitToolEnabled,
 						waitToolDefaultTimeoutMs: params.waitToolDefaultTimeoutMs,
 						...(params.agentContract ? { agentContract: params.agentContract } : {}),
-						definitionDigest: agentDefinitionDigest(agentConfig),
-						launchBindingTask: task,
+						// Recovery materializes launch overrides; those are not a new role declaration.
+						definitionDigest: params.nativeContinuation ? params.nativeDefinitionDigest : agentDefinitionDigest(agentConfig),
+						launchBindingTask,
 						launchContractDigest,
 						...(extensionBindings ? { extensionBindings } : {}),
 						launchResolvedExtensions,
@@ -1953,6 +2064,7 @@ export function executeAsyncSingle(
 						...(lane ? { lane } : {}),
 					},
 				],
+				...(params.nativeContinuation ? { nativeContinuation: params.nativeContinuation } : {}),
 				resultPath: params.parentWorkflowRunId !== undefined && (params.revivalLease !== undefined || params.workflowAwaitAsync === true)
 					? workflowAwaitedAsyncResultPath(asyncDir)
 					: inheritedNestedRoute ? nestedResultsPath(inheritedNestedRoute.rootRunId, id) : resultFilePath(DIRS.results, id),

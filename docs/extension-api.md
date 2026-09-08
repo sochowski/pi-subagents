@@ -406,26 +406,91 @@ Foreground children never load the parent's ambient extensions: they share the p
 
 ## External job provider bridge
 
-Extensions that own long-running advisor jobs can register a process-local provider for `runner.type: external-job` agents:
+External-job providers receive a **package-owned, immutable launch requirements contract**. This is an explicit versioned opt-in, not a native Pi backend or a process sandbox.
+
+- Registry protocol remains v1. Set `launchRequirementsVersion: 1` only if the provider enforces **or rejects every requirement before side effects**, including recovery. Unknown provider requirement versions fail closed.
+- Legacy providers (no opt-in) may receive only newly admitted **unrestricted** jobs: no explicit tool allowlist/exclusions, nested-subagent authorization, configured/disabled extensions, or capability ceiling. `tools: []` is a zero-tools restriction, not unrestricted. Missing old launch attestations are **not** migrated from current settings: pre-contract jobs cannot be recovered or continued through this API.
+- The same admission checks reject explicit/profile native model and thinking requirements (including thinking ceilings), MCP selections, skills, fork context, structured output, acceptance contracts, tool budgets, fast mode, permission rules, extension bindings, and managed worktrees. Provider-owned defaults are not native Pi model/context/skill inheritance. An ambient `subagents.defaultModel` is not an external model requirement; a profile model pin is. Use provider `options` for provider-specific modes, never to attest restrictions.
+- `start` and optional `followUp` receive `input.launchRequirements`. `status`, `result`, and `reattach` receive `(providerJobId, { launchRequirements })`. Opted-in providers must return `launchRequirementsDigest: launchRequirements.digest` on **every** handle/result, only after checking/enforcing that exact contract. Handles still contain `providerJobId`, `state`, optional URLs/failure/blocking fields; results may add `output` or `artifactPath`.
+
+`launchRequirements.version` and `admission.version` are both `1`. The admission binds the owner key (`ownerSessionId`: session file when persisted, native id otherwise), native direct-parent `parentSessionId`, run, provider, absolute cwd, agent, effective profile-definition digest, assembled system-prompt digest, and options digest. It snapshots the existing resolved tool plan: `tools.allowlist` (`null` = provider defaults; `[]` = no tools), `exclude`, `required`, `allowNestedSubagents`, `extensions.disableAmbient`, `extensions.configured`, and the intersected `capabilityCeiling`. No native runtime hooks are silently granted. The outer digest additionally binds the materialized prompt digest, flat step index, and continuation lineage.
+
+Admission is serialized with the runner launch configuration. Before dispatch, the fully materialized contract is exclusively persisted in `external-job-<index>.requirements.json`; status/results retain it in `externalJob.launchRequirements`. The durable requirements file additionally records the provider job id after dispatch (outside the immutable digest). Unknown/missing versions, digests, fields, or mismatched bindings fail closed. Recovery uses the same persisted contract, not current profiles. Newly active ceilings under either owner identity can reject dispatch/recovery but cannot remove admitted restrictions. Inherited continuation requirements survive disposed registrations and less restrictive current profiles; conflicting requirements are rejected rather than relaxed.
+
+`followUp` must continue exactly `parentProviderJobId`, or reject: it must not silently open a fresh conversation. Its stable request digest/run identity includes `parentRequirementsDigest`; the contract lineage also carries source run/step, request id/digest and parent provider job id. Providers must durably deduplicate by admitted contract digest and bind their own job/conversation records to it. Duplicate continuation requests are recognized only with matching durable contracts; a retry arriving before the dispatch contract exists fails closed and can be retried after admission is visible. Local tracking cannot prove an external process's enforcement merely from its acknowledgement.
+
+### Consumer example: reject all native restrictions
+
+This example adapts a consumer-owned `backend` with durable exact-job lookup. Its `startOnce`, `followUpOnce`, and `exactJob` must implement the stated identity/deduplication rules; echoing a digest alone is not enforcement. No private pi-subagents imports are needed.
 
 ```ts
-import { registerExternalJobProvider } from "pi-subagents/external-job-provider";
+import {
+  registerExternalJobProvider,
+  type ExternalJobLaunchRequirements,
+} from "pi-subagents/external-job-provider";
+
+function requireProviderDefaults(c: ExternalJobLaunchRequirements) {
+  if (c.version !== 1 || c.admission.version !== 1 || !/^[a-f0-9]{64}$/.test(c.digest))
+    throw new Error("Unsupported or missing admitted launch contract");
+  const r = c.admission.requirements;
+  if (r.nativeFeatures !== "none" || r.tools.allowlist !== null ||
+      r.tools.exclude.length || r.tools.required.length || r.tools.allowNestedSubagents ||
+      r.extensions.disableAmbient || r.extensions.configured.length || r.capabilityCeiling !== null)
+    throw new Error("This provider cannot enforce these admitted restrictions");
+  // Also validate the consumer's allowed owner, provider and canonical cwd.
+}
 
 const dispose = registerExternalJobProvider({
-  name: "surf-oracle",
-  start: ({ prompt, promptDigest, cwd, runId, stepIndex, agent, options }) => startSurfJob({ prompt, promptDigest, cwd, runId, stepIndex, agent, options }),
-  followUp: ({ prompt, parentProviderJobId, requestId, requestDigest, options }) => followUpSurfJob({ prompt, parentProviderJobId, requestId, requestDigest, options }),
-  status: (providerJobId) => getSurfJobStatus(providerJobId),
-  result: (providerJobId) => getSurfJobResult(providerJobId),
-  reattach: (providerJobId) => reattachSurfJob(providerJobId),
+  name: "my-provider",
+  launchRequirementsVersion: 1,
+  async start(input) {
+    const c = input.launchRequirements;
+    requireProviderDefaults(c);
+    const handle = await backend.startOnce(c.digest, input);
+    return { ...handle, launchRequirementsDigest: c.digest };
+  },
+  async followUp(input) {
+    const c = input.launchRequirements;
+    requireProviderDefaults(c);
+    const handle = await backend.followUpOnce(c.digest, input); // exact parent or reject
+    return { ...handle, launchRequirementsDigest: c.digest };
+  },
+  async status(id, { launchRequirements: c }) {
+    requireProviderDefaults(c);
+    const handle = await backend.exactJob(id, c).status();
+    return { ...handle, launchRequirementsDigest: c.digest };
+  },
+  async result(id, { launchRequirements: c }) {
+    requireProviderDefaults(c);
+    const result = await backend.exactJob(id, c).result();
+    return { ...result, launchRequirementsDigest: c.digest };
+  },
+  async reattach(id, { launchRequirements: c }) {
+    requireProviderDefaults(c);
+    const handle = await backend.exactJob(id, c).reattach();
+    return { ...handle, launchRequirementsDigest: c.digest };
+  },
 });
 ```
 
-The provider returns handles with `providerJobId`, `state`, optional `handleUrl`/`conversationUrl`, optional `failureCode`/`failureMessage`, and optional `blockingJobId` for capacity conflicts. `result` can also return `output` and/or `artifactPath`.
+An unrestricted profile for this rejection-only consumer deliberately **omits** `tools`, `excludeTools`, `extensions`, model/thinking pins, MCP and skills:
 
-`followUp(input)` is optional. When it is present, a completed external-job run can be continued with `subagent({ action: "resume", id: "<run>", message: "..." })`. Pi sends the completed parent provider job id plus a stable `requestId` and `requestDigest`. The provider must continue that parent conversation or fail closed. It must not open a fresh thread when the parent conversation is missing.
+```yaml
+---
+name: my-peer
+description: Provider-owned peer; native restrictions are rejected
+runner:
+  type: external-job
+  provider: my-provider
+systemPromptMode: replace
+inheritProjectContext: false
+inheritGlobalContext: false
+inheritSkills: false
+---
+Complete the supplied handoff. Provider-owned defaults apply.
+```
 
-The async runner process does not import provider internals. It writes operation requests into its async run directory. The parent Pi process services those requests against the registered provider and writes operation responses. If the provider is not registered, the bridge fails closed with an actionable error. If a run is recovered after provider job metadata exists, the runner calls `reattach` and `result`; it does not call `start` or `follow-up` again.
+The async runner writes operation requests in its run directory; the host bridge invokes the registered provider. A missing provider fails closed. Recovery uses `reattach`/`result`, not redispatch. **Stop/timeout ends local tracking, not the provider conversation**; provider human/supervisor controls govern that conversation. This contract adds no stop/steer callbacks, native tool/model execution, WT adapter, or malicious-process sandboxing.
 
 ## Herdr integration
 

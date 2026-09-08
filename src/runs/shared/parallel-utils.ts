@@ -10,10 +10,12 @@ export interface RunnerSubagentStep {
 	sessionName?: string;
 	task: string;
 	runner?: ResolvedRunnerConfig;
+	externalJobAdmission?: import("../../api/external-job-provider.ts").ExternalJobAdmission;
 	externalJobFollowUp?: {
 		sourceRunId: string;
 		sourceStepIndex: number;
 		parentProviderJobId: string;
+		parentRequirementsDigest: string;
 		requestId: string;
 		requestDigest: string;
 	};

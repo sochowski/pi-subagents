@@ -1,4 +1,6 @@
 import * as fs from "node:fs";
+import { Check } from "typebox/value";
+import { nativeHumanInterventionEffectsSchema, projectNativeHumanIntervention } from "../shared/native-human-intervention.ts";
 import type { ArtifactPaths, SubagentState, Usage, WaitCompletion, WaitCompletionChild } from "../../shared/types.ts";
 import type { AsyncRunSummary } from "./async-status.ts";
 import { readCompletionReplay, writeCompletionReplay } from "./completion-replay.ts";
@@ -78,7 +80,8 @@ export function toWaitCompletion(data: Record<string, unknown>, runId: string): 
 			const structuredOutputPath = asNonEmptyString(child.structuredOutputPath);
 			const contextOverflow = child.contextOverflow === true;
 			const timeoutRecovery = projectTimeoutRecovery(child.timeoutRecovery);
-			return [{
+			const humanIntervention = Check(nativeHumanInterventionEffectsSchema, child.effects) ? projectNativeHumanIntervention(child.effects.humanIntervention) : undefined;
+			const projected: WaitCompletionChild = {
 				...(agent ? { agent } : {}),
 				...(childRunId ? { runId: childRunId } : {}),
 				...(usage ? { usage } : {}),
@@ -92,7 +95,9 @@ export function toWaitCompletion(data: Record<string, unknown>, runId: string): 
 				...(contextOverflow ? { contextOverflow: true } : {}),
 				...(artifactPaths ? { artifactPaths } : {}),
 				...(timeoutRecovery ? { timeoutRecovery } : {}),
-			}];
+			};
+			if (humanIntervention) projected.effects = { humanIntervention };
+			return [projected];
 		})
 		: undefined;
 	const agent = asNonEmptyString(data.agent);

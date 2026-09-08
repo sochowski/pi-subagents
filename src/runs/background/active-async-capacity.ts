@@ -1,3 +1,4 @@
+import { hasNativeTrackingRelease } from "./native-runner-route.ts";
 import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -219,6 +220,7 @@ function runnerReleaseVerdict(owner: ActiveAsyncCapacityOwner, status: AsyncStat
 	if (status.sessionId !== owner.ownerSessionId) return { state: "retained", reason: `status session ${status.sessionId ?? "unknown"} does not match owner session ${owner.ownerSessionId}` };
 	if (status.runId !== owner.runId) return { state: "retained", reason: `status run ${status.runId} does not match owner run ${owner.runId}` };
 	if (!terminalState(status.state)) return { state: "retained", reason: `run is still ${status.state}` };
+	if (status.nativeExecution && hasNativeTrackingRelease(owner.asyncDir, owner.runId, owner.ownerSessionId, owner.runnerProcessInstanceId)) return { state: "releasable", reason: "native turn tracking released; interactive host remains retained" };
 	if (status.processTerminal?.state === "not-started"
 		&& status.processTerminal.runId === owner.runId
 		&& status.processTerminal.runnerProcessInstanceId === owner.runnerProcessInstanceId
@@ -280,13 +282,14 @@ function workflowReleaseVerdict(owner: ActiveAsyncCapacityOwner, status: AsyncSt
 		if (!childStatus) return { state: "retained", reason: `async workflow child ${label} status is missing or unreadable` };
 		if (!terminalState(childStatus.state)) return { state: "retained", reason: `async workflow child ${label} is still ${childStatus.state}` };
 		if (!childStatus.processTerminal?.runnerProcessInstanceId) return { state: "retained", reason: `async workflow child ${label} has no runner process identity` };
+		if (childStatus.nativeExecution && hasNativeTrackingRelease(childDir, step.runId, owner.ownerSessionId, childStatus.processTerminal.runnerProcessInstanceId)) continue;
 		const proof = readProcessTerminal(childDir, {
 			runId: step.runId,
 			runnerProcessInstanceId: childStatus.processTerminal.runnerProcessInstanceId,
 		});
 		if (proof?.state !== "observed" || proof.runId !== step.runId) return { state: "retained", reason: `async workflow child ${label} process-terminal proof is ${proof?.state ?? "missing"}` };
 	}
-	return { state: "releasable", reason: "workflow is terminal, controller is gone, and async children have observed proof" };
+	return { state: "releasable", reason: "workflow is terminal, controller is gone, and async children have process-terminal or retained-native tracking proof" };
 }
 
 function ownerReleaseVerdict(owner: ActiveAsyncCapacityOwner, liveWorkflowRunIds: ReadonlySet<string>, options: CapacityOptions): ActiveAsyncCapacityReleaseVerdict {
