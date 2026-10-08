@@ -5108,6 +5108,13 @@ async function runConfiguredSubagent(config: SubagentRunConfig): Promise<void> {
 	process.once("exit", releaseOnExit);
 	try {
 		if (config.launchBarrierToken) {
+			// Observability only: proves this exact physical runner reached the
+			// barrier. It neither opens an SDK session nor publishes a prompt.
+			writePrivateAtomicJson(path.join(config.asyncDir, "runner-startup-ready.json"), {
+				version: 1, runId: config.id, runnerProcessInstanceId: config.runnerProcessInstanceId,
+				token: config.launchBarrierToken, pid: process.pid,
+				...(config.nativeExecution ? { nativeExecution: config.nativeExecution } : {}),
+			});
 			await waitForStartupControl(startupProceedPath, config.launchBarrierToken, "proceed");
 			startupCommitted = true;
 			try {

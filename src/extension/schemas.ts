@@ -314,6 +314,7 @@ const SubagentParamProperties = {
 	topic: Type.Optional(Type.String()),
 	message: Type.Optional(Type.String({ description: "Follow-up message for resume, live guidance for steer, or optional startup prompt for project.open." })),
 	mode: Type.Optional(Type.String({ enum: ["steer", "follow_up", "auto", "plan", "apply"], description: "Delivery mode for action='steer', or plan/apply mode for worktree.cleanup. worktree.cleanup currently supports plan only; apply/removal is not available yet." })),
+	nativeColdRecovery: Type.Optional(Type.Boolean({ description: "Explicit new settled-only native recovery operation with action='resume'. Never inferred from a dead PID. Requires an authoritative WT lease/new ownership epoch; no failed/uncertain turn, role change, budget reset or old queue replay." })),
 	steeringRecovery: Type.Optional(Type.Boolean({ description: "For action='steer', allow pause-and-revive recovery after a missed acknowledgment. Defaults true for direct tool calls in steer mode; extension RPC steering forces false so callers retain exact child ownership." })),
 	additional: Type.Optional(Type.Integer({ minimum: 1, description: "Positive launches to add with action='grant-spawn-budget'. Root interactive parent with native user confirmation only; total grants cannot exceed the original configured cap." })),
 	scope: Type.Optional(Type.String({ enum: ["session", "user", "project"], description: "Scope for action='watchdog.configure'. Defaults to session to avoid persistent settings writes unless user/project is explicit." })),

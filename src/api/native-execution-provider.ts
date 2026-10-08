@@ -24,6 +24,13 @@ export interface NativeExecutionBinding {
 	hostPid?: number;
 	nativeId?: string;
 	sessionFile?: string;
+	/** New physical ownership epoch, never an old warm PID impersonation. */
+	coldRecovery?: {
+		version: 1; leaseId: string; operation: string; leaf: string;
+		cwd: string; sourceDigest: string; sidecarDigest: string;
+		modelId: string; thinking: string;
+		request: Record<string, unknown>;
+	};
 }
 
 export interface NativeExecutionProvider {

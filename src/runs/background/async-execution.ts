@@ -221,6 +221,8 @@ interface AsyncChainParams {
 
 interface AsyncSingleParams {
 	nativeContinuation?: import("../../api/native-execution-provider.ts").NativeExecutionBinding;
+	/** Explicit settled-only cold operation; never inferred from ESRCH. */
+	nativeColdRecovery?: boolean;
 	/** Current declared role identity verified by public native resume, before recovery overrides. */
 	nativeDefinitionDigest?: string;
 	agent: string;
@@ -569,7 +571,7 @@ export function spawnRunner(cfg: object, suffix: string, cwd: string, initialSta
 	// Admission consumes the already resolved native runner data, before any process is spawned.
 	const nativeExecution = prepareNativeRunner(cfg as Record<string, unknown>);
 	const launchConfig = { ...cfg, ...(nativeExecution ? { nativeExecution } : {}), runnerProcessInstanceId, ...(launchBarrierToken ? { launchBarrierToken } : {}) };
-	if (!nativeExecution?.previousTurnId) {
+	if (!nativeExecution?.previousTurnId || (cfg as { nativeColdRecovery?: boolean }).nativeColdRecovery === true) {
 		try { writePrivateAtomicJson(cfgPath, launchConfig); }
 		catch (error) {
 			if (nativeExecution) requiredNativeProvider(nativeExecution.ownerSessionId)?.provider.cancelPrepared?.(nativeExecution, String(error));
@@ -599,7 +601,7 @@ export function spawnRunner(cfg: object, suffix: string, cwd: string, initialSta
 		if (!required || required.provider.name !== nativeExecution.provider) return { error: "Required native provider changed after admission; no fallback is permitted." };
 		if (!launchAsyncDir || !startupProceedPath || !launchBarrierToken) return { error: "Native host requires a fresh runner startup barrier." };
 		const preload = hostPeerAliases.supplemental.length > 0 ? ["--import", new URL("../../../runner-server-preload.mjs", import.meta.url).href] : [];
-		if (nativeExecution.previousTurnId) {
+		if (nativeExecution.previousTurnId && (cfg as { nativeColdRecovery?: boolean }).nativeColdRecovery !== true) {
 			const previous = (cfg as { nativeContinuation?: import("../../api/native-execution-provider.ts").NativeExecutionBinding }).nativeContinuation;
 			if (!previous?.controlPath || !required.provider.continue) throw new Error("Native continuation control route is unavailable.");
 			const publicationPath = path.join(launchAsyncDir, "native-publication.json");
@@ -631,6 +633,11 @@ export function spawnRunner(cfg: object, suffix: string, cwd: string, initialSta
 			return { pid: continued.pid, runnerProcessInstanceId };
 		}
 		writePrivateAtomicJson(path.join(launchAsyncDir, "native-runner.json"), launchConfig);
+		if ((cfg as { nativeColdRecovery?: boolean }).nativeColdRecovery === true) {
+			writePrivateAtomicJson(path.join(launchAsyncDir, "native-execution.json"), nativeExecution);
+			writePrivateAtomicJson(initialStatusPath, { ...initialStatus, nativeExecution });
+			writePrivateAtomicJson(path.join(launchAsyncDir, "native-publication.json"), { ...nativeExecution, runnerProcessInstanceId, publication: "uncertain" });
+		}
 		const launched = required.provider.launch({
 			binding: nativeExecution, command: nodeCommand, args: [...preload, jitiCliPath, runner, cfgPath], cwd,
 			env: { ...omitExtensionBindingsEnv(process.env), [PI_CODING_AGENT_PACKAGE_ROOT_ENV]: piPackageRoot, [JITI_ALIAS_ENV]: JSON.stringify(hostPeerAliases.aliases), [REQUIRED_NATIVE_PROVIDER_ENV]: nativeExecution.provider },
@@ -2064,7 +2071,7 @@ export function executeAsyncSingle(
 						...(lane ? { lane } : {}),
 					},
 				],
-				...(params.nativeContinuation ? { nativeContinuation: params.nativeContinuation } : {}),
+				...(params.nativeContinuation ? { nativeContinuation: params.nativeContinuation, ...(params.nativeColdRecovery === true ? { nativeColdRecovery: true } : {}) } : {}),
 				resultPath: params.parentWorkflowRunId !== undefined && (params.revivalLease !== undefined || params.workflowAwaitAsync === true)
 					? workflowAwaitedAsyncResultPath(asyncDir)
 					: inheritedNestedRoute ? nestedResultsPath(inheritedNestedRoute.rootRunId, id) : resultFilePath(DIRS.results, id),
