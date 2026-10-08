@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import { createChildHostContextHook, type ChildHostContext } from "./child-host-context.ts";
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
 import type { NativeHumanIntervention } from "../../shared/types.ts";
 import { extractTextFromContent } from "../../shared/utils.ts";
 import type { ChildSessionEvent } from "./child-session.ts";
@@ -19,6 +19,17 @@ export interface NativeInteractiveHost extends ChildSessionFactory {
 
 export interface NativeHostDriver {
 	version: 1;
+	/** Explicit authority for a NEW physical epoch, never a warm-host fallback. */
+	recovery?: {
+		version: 1;
+		leaseId: string;
+		expected: import("./native-checkpoint-inspection.ts").NativeCheckpointExpectation;
+		sourceDigest: string;
+		sidecarDigest: string;
+		modelId: string;
+		thinking: string;
+		authorizeOpen(): Promise<void>;
+	};
 	/** Optional tool-free host orientation, refreshed on every turn including continuation. */
 	context?: ChildHostContext;
 	/** Tool-free WT inbox/lifecycle service, present even with ambient extensions disabled. */
@@ -50,10 +61,24 @@ export function createNativeInteractiveHost(options: Pick<DefaultChildSessionFac
 	let onExtensionError: ChildSessionLaunch["onExtensionError"];
 	const resources = (launch: ChildSessionLaunch) => JSON.stringify({ cwd: launch.cwd, model: launch.model, tools: launch.tools, excludeTools: launch.excludeTools, extensionPaths: launch.extensionPaths, ambientExtensions: launch.ambientExtensions, noSkills: launch.noSkills, noContextFiles: launch.noContextFiles, systemPrompt: launch.systemPrompt, appendSystemPrompt: launch.appendSystemPrompt, processEnv: launch.processEnv, capabilityCeiling: launch.runtime.capabilityCeiling, thinkingCeiling: launch.runtime.thinkingCeiling });
 	const currentModel = () => runtime && JSON.stringify({ provider: runtime.session.model?.provider, id: runtime.session.model?.id, thinking: runtime.session.thinkingLevel, tools: runtime.session.getActiveToolNames() });
+	const recovery = options.driver?.recovery;
 	const factory = createDefaultChildSessionFactory({
 		...options,
+		...(recovery ? { nativeRecovery: recovery } : {}),
 		retainSession: true,
 		async sessionHost(pi, result, services) {
+			if (recovery) {
+				const session = result.session;
+				if (`${session.model?.provider}/${session.model?.id}` !== recovery.modelId || session.thinkingLevel !== recovery.thinking) throw new Error("Cold SDK changed its observed model/thinking; no fallback.");
+				// Block extension/UI prompts during startup BEFORE InteractiveMode
+				// binds session_start handlers. An old queue is never resumed.
+				const prompt = session.prompt.bind(session);
+				session.prompt = async (...args) => { if (!executing && !humanInputAllowed) throw new Error("Cold native host has no newly claimed model dispatch permit."); return prompt(...args); };
+				const steer = session.steer.bind(session);
+				session.steer = async (...args) => { if (!executing && !humanInputAllowed) throw new Error("Cold native boundary does not accept queued steering."); return steer(...args); };
+				const followUp = session.followUp.bind(session);
+				session.followUp = async (...args) => { if (!executing && !humanInputAllowed) throw new Error("Cold native boundary does not accept queued follow-up."); return followUp(...args); };
+			}
 			// This constructor adopts the very session created above. A runtime
 			// replacement is forbidden: WT owns one exact native conversation.
 			runtime = new pi.AgentSessionRuntime(result.session, services, async () => {
@@ -113,7 +138,8 @@ export function createNativeInteractiveHost(options: Pick<DefaultChildSessionFac
 		async create(launch) {
 			if (!process.stdin.isTTY || !process.stdout.isTTY) throw new Error("Native interactive host requires a real terminal; headless fallback is forbidden.");
 			if (claimed && !continuation) throw new Error("Native interactive host already owns a conversation; opening a second SDK writer is forbidden.");
-			if (!continuation && launch.storage.kind === "file" && fs.existsSync(launch.storage.sessionFile) || launch.storage.kind === "memory") throw new Error("Native interactive host initial launch requires a fresh persistent conversation.");
+			if ((!continuation && !recovery && launch.storage.kind === "file" && fs.existsSync(launch.storage.sessionFile)) || launch.storage.kind === "memory") throw new Error("Native interactive host initial launch requires a fresh persistent conversation.");
+			if (recovery && !continuation && (recovery.version !== 1 || options.binding?.nativeId !== recovery.expected.nativeId || options.binding?.sessionFile !== recovery.expected.sessionFile || !options.binding?.previousTurnId)) throw new Error("Explicit cold host requires its exact admitted original native binding and tool set.");
 			claimed = true;
 			onExtensionError = launch.onExtensionError;
 			// Host guards are additional hooks, not ambient WT tools. Role hooks
@@ -178,7 +204,15 @@ export function createNativeInteractiveHost(options: Pick<DefaultChildSessionFac
 			}
 			if (options.binding) {
 				if (!created.sessionFile || !options.driver) throw new Error("Native host requires a durable transcript and binding driver.");
-				fs.writeFileSync(`${created.sessionFile}.native-host.json`, JSON.stringify({ ...options.binding, hostPid: process.pid, nativeId: created.sessionId, sessionFile: created.sessionFile }), { flag: continuing ? "w" : "wx", mode: 0o600 });
+				const recordFile = `${created.sessionFile}.native-host.json`;
+				const record = JSON.stringify({ ...options.binding, hostPid: process.pid, nativeId: created.sessionId, sessionFile: created.sessionFile, ...(recovery ? { coldEpoch: { version: 1, leaseId: recovery.leaseId } } : {}) });
+				if (recovery && !continuing) {
+					if (created.sessionId !== recovery.expected.nativeId || created.sessionFile !== recovery.expected.sessionFile || created.nativeLeaf !== recovery.expected.leaf) throw new Error("Actual cold SDK identity/leaf changed before publication.");
+					if (createHash("sha256").update(fs.readFileSync(recordFile)).digest("hex") !== recovery.sidecarDigest) throw new Error("Original cold host record changed before publication.");
+					const temporary = `${recordFile}.${recovery.leaseId}.tmp`;
+					fs.writeFileSync(temporary, record, { flag: "wx", mode: 0o600 });
+					fs.renameSync(temporary, recordFile);
+				} else fs.writeFileSync(recordFile, record, { flag: continuing ? "w" : "wx", mode: 0o600 });
 				if (!continuing) {
 					try { await options.driver.bind(created); }
 					catch (error) { try { await options.driver.failStartup?.(String(error)); startupFailureSettled = true; } finally { await runtime?.dispose(); } throw error; }

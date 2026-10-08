@@ -47,7 +47,9 @@ export function prepareNativeRunner(config: Record<string, unknown>): NativeExec
 	const binding = required.provider.prepare(admission);
 	try {
 		validateNativeExecutionBinding(config, binding);
-		if (binding.provider !== required.provider.name || previous && (binding.jobId !== previous.jobId || binding.previousTurnId !== previous.turnId || binding.nativeId !== previous.nativeId || binding.sessionFile !== previous.sessionFile || binding.controlPath !== previous.controlPath)) throw new Error("Native provider changed the admitted conversation identity.");
+		if (binding.provider !== required.provider.name || previous && (binding.jobId !== previous.jobId || binding.previousTurnId !== previous.turnId || binding.nativeId !== previous.nativeId || binding.sessionFile !== previous.sessionFile || (!config.nativeColdRecovery && binding.controlPath !== previous.controlPath))) throw new Error("Native provider changed the admitted conversation identity.");
+		if (config.nativeColdRecovery === true && (!previous || !binding.coldRecovery || binding.coldRecovery.version !== 1 || binding.coldRecovery.operation !== config.id || binding.coldRecovery.leaseId.length !== 64 || binding.hostPid !== undefined || binding.controlPath === previous.controlPath)) throw new Error("Explicit cold native operation lacks its new ownership epoch/control route.");
+		if (config.nativeColdRecovery !== true && binding.coldRecovery && previous?.coldRecovery?.leaseId !== binding.coldRecovery.leaseId) throw new Error("Provider attempted an implicit cold native startup.");
 		return binding;
 	} catch (error) {
 		required.provider.cancelPrepared?.(binding, String(error));
@@ -124,6 +126,8 @@ export function nativeContinuationAcceptanceTask(previous: NativeExecutionBindin
 
 const nativePublicationSchema = Type.Object({
 	...nativeExecutionBindingSchema.properties,
+	pid: Type.Optional(Type.Integer({ minimum: 1 })),
+	runtime: Type.Optional(nativeIdentity),
 	runnerProcessInstanceId: nativeIdentity,
 	publication: Type.Union([Type.Literal("published"), Type.Literal("not-published"), Type.Literal("uncertain")]),
 });
@@ -139,8 +143,9 @@ const nativePublicationAnchorSchema = Type.Object({
 /** Missing/corrupt receipts are uncertainty, never proof of pre-publication failure. */
 export function nativePublicationOutcome(asyncDir: string, binding: NativeExecutionBinding): { publication: "published" | "not-published" | "uncertain"; runnerProcessInstanceId?: string } | undefined {
 	if (!binding.previousTurnId) return undefined;
+	const coldOperation = binding.coldRecovery?.operation === binding.runId;
 	const identityFields = ["version", "provider", "ownerSessionId", "parentSessionId", "runId", "jobId", "turnId", "previousTurnId", "configDigest", "driverModule", "hostPid", "controlPath", "nativeId", "sessionFile", "conversationDigest"] as const;
-	const matches = (record: NativeExecutionBinding) => identityFields.every(key => record[key] === binding[key]);
+	const matches = (record: NativeExecutionBinding) => identityFields.every(key => record[key] === binding[key]) && (!binding.coldRecovery || Boolean(record.coldRecovery && stableJsonDigest(record.coldRecovery) === stableJsonDigest(binding.coldRecovery)));
 	let expectedInstance: string;
 	try {
 		const anchor = readNativeRunnerConfig(path.join(asyncDir, "native-runner.json"));
@@ -153,10 +158,13 @@ export function nativePublicationOutcome(asyncDir: string, binding: NativeExecut
 		const record = readNativeRunnerConfig(path.join(asyncDir, "native-publication.json"));
 		if (Check(nativePublicationSchema, record) && matches(record) && record.runnerProcessInstanceId === expectedInstance) receipt = record;
 	} catch { /* Initial ownership can survive a crash before the publication record. */ }
-	if (receipt?.publication === "not-published" || receipt?.publication === "published") return receipt;
+	// Cold launch is not SDK admission. Only the actual SDK owner's observed
+	// receipt below can resolve it; pre-open cancellation does not exist for a
+	// consumed cold epoch and must not be invented by a transport receipt.
+	if (!coldOperation && (receipt?.publication === "not-published" || receipt?.publication === "published")) return receipt;
 	try {
 		const observed = readNativeRunnerConfig(path.join(asyncDir, "native-publication-observed.json"));
-		if (Check(nativePublicationSchema, observed) && observed.publication === "published" && matches(observed) && observed.runnerProcessInstanceId === expectedInstance) return observed;
+		if (Check(nativePublicationSchema, observed) && observed.publication === "published" && matches(observed) && observed.runnerProcessInstanceId === expectedInstance && (!coldOperation || Number.isSafeInteger(observed.pid) && Number(observed.pid) > 0 && typeof observed.runtime === "string" && observed.runtime.length > 0)) return observed;
 	} catch { /* Only this exact retained writer can resolve uncertain publication. */ }
 	return { publication: "uncertain", runnerProcessInstanceId: expectedInstance };
 }

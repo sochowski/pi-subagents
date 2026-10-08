@@ -13,9 +13,13 @@ import { validateNativeExecutionBinding } from "./native-runner-route.ts";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import { createDefaultChildSessionFactory, type ChildSessionFactory } from "../shared/child-session.ts";
+import { writePrivateAtomicJson } from "../../shared/atomic-json.ts";
 
 export interface RunnerChildSessionConfig {
 	nativeExecution?: NativeExecutionBinding;
+	nativeColdRecovery?: boolean;
+	asyncDir?: string;
+	runnerProcessInstanceId?: string;
 	/** Test seam: module whose default export is a `ChildSessionFactory`, or a function returning one. */
 	childSessionFactoryModule?: string;
 }
@@ -31,6 +35,18 @@ export async function loadRunnerChildSessionFactory(config: RunnerChildSessionCo
 		validateNativeExecutionBinding(config as unknown as Record<string, unknown>, binding);
 		if (required !== binding.provider || config.childSessionFactoryModule) throw new Error("Native host bootstrap mismatch or incompatible test factory; headless fallback is forbidden.");
 		const driver = await loadNativeHostDriver(binding);
+		if (config.nativeColdRecovery === true) {
+			if (!binding.coldRecovery || !driver.recovery || !config.asyncDir || !path.isAbsolute(config.asyncDir) || !config.runnerProcessInstanceId || binding.controlPath !== path.join(config.asyncDir, "native-control.json")) throw new Error("Cold native publication requires its exact new runner/SDK ownership route.");
+			const claim = driver.claim!.bind(driver);
+			const publicationFile = path.join(config.asyncDir, "native-publication-observed.json");
+			driver.claim = async (child, prompt) => {
+				await claim(child, prompt);
+				if (child.sessionId !== binding.nativeId || child.sessionFile !== binding.sessionFile) throw new Error("Actual cold SDK identity changed at dispatch publication.");
+				// Only the actual SDK owner, after authoritative one-shot claim,
+				// can attest acceptance. Launch alone never promotes uncertainty.
+				writePrivateAtomicJson(publicationFile, { ...binding, runnerProcessInstanceId: config.runnerProcessInstanceId, publication: "published", pid: process.pid, runtime: process.env.WT_RUNTIME_ID, nativeId: child.sessionId, sessionFile: child.sessionFile });
+			};
+		}
 		return createNativeInteractiveHost({ binding, driver });
 	}
 	if (required) throw new Error("Required native provider runner binding is missing; default and test factories are forbidden.");

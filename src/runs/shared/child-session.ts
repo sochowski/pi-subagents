@@ -128,6 +128,13 @@ export interface DefaultChildSessionFactoryOptions {
 	loadPiCodingAgent?: () => Promise<PiCodingAgentModule>;
 	/** Package-owned host binding. Runs on the same SDK session; never opens its transcript again. */
 	sessionHost?: (pi: PiCodingAgentModule, result: import("@earendil-works/pi-coding-agent").CreateAgentSessionResult, services: import("@earendil-works/pi-coding-agent").AgentSessionServices) => Promise<void>;
+	/** Explicit cold-host authority. Not supplied to ordinary/headless factories. */
+	nativeRecovery?: {
+		expected: import("./native-checkpoint-inspection.ts").NativeCheckpointExpectation;
+		sourceDigest: string;
+		/** One-shot authoritative WT epoch/open claim, before any SDK/resources. */
+		authorizeOpen(): Promise<void>;
+	};
 	/** A retained host owns shutdown; attempt disposal only releases tracking. */
 	retainSession?: boolean;
 	/** Upper bound on a disposed child's `session_shutdown` handlers before the session is dropped anyway. */
@@ -206,9 +213,19 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 	return {
 		async create(launch) {
 			if (!options.sessionHost) assertDefaultNativeLaunchAllowed(launch.runtime.parentSessionId);
-			if (launch.storage.kind === "file" && fs.existsSync(`${launch.storage.sessionFile}.native-host.json`)) throw new Error("This transcript belongs to a retained native host; opening a second SDK writer is forbidden.");
+			const cold = options.nativeRecovery;
+			if (cold) {
+				if (!options.sessionHost || launch.storage.kind !== "file" || launch.storage.sessionFile !== cold.expected.sessionFile || launch.cwd !== cold.expected.cwd) throw new Error("Cold native SDK open requires its exact admitted interactive host/file/cwd.");
+				await cold.authorizeOpen();
+			}
+			if (!cold && launch.storage.kind === "file" && fs.existsSync(`${launch.storage.sessionFile}.native-host.json`)) throw new Error("This transcript belongs to a retained native host; opening a second SDK writer is forbidden.");
 			const observeReadonly = prepareReadonlySessionEvidence(launch);
 			const pi = await loadPiCodingAgent();
+			if (cold) {
+				const { inspectNativeCheckpoint } = await import("./native-checkpoint-inspection.ts");
+				const proof = inspectNativeCheckpoint(cold.expected, pi);
+				if (proof.sourceDigest !== cold.sourceDigest) throw new Error("Cold native SDK transcript changed after WT admission.");
+			}
 			const modelRuntime = await sharedRuntime(pi);
 			const agentDir = getAgentDir();
 			const settingsManager = pi.SettingsManager.create(launch.cwd, agentDir);
@@ -236,8 +253,12 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 				await flushQueuedProviderRegistrations(loader, modelRuntime, launch.onExtensionError);
 				// No await between receipt validation and the SDK's permissive file open.
 				observeReadonly?.beforeOpen();
-				if (launch.storage.kind === "file" && fs.existsSync(`${launch.storage.sessionFile}.native-host.json`)) throw new Error("Native ownership appeared during loading; a second SDK writer is forbidden.");
-				if (options.sessionHost && launch.storage.kind === "file" && fs.existsSync(launch.storage.sessionFile)) throw new Error("Native fresh transcript appeared before creation; refusing to reopen another writer's file.");
+				if (!cold && launch.storage.kind === "file" && fs.existsSync(`${launch.storage.sessionFile}.native-host.json`)) throw new Error("Native ownership appeared during loading; a second SDK writer is forbidden.");
+				if (!cold && options.sessionHost && launch.storage.kind === "file" && fs.existsSync(launch.storage.sessionFile)) throw new Error("Native fresh transcript appeared before creation; refusing to reopen another writer's file.");
+				if (cold) {
+					const { inspectNativeCheckpoint } = await import("./native-checkpoint-inspection.ts");
+					if (inspectNativeCheckpoint(cold.expected, pi).sourceDigest !== cold.sourceDigest) throw new Error("Cold checkpoint changed during SDK resource loading.");
+				}
 				const sessionManager = launch.storage.kind === "file"
 					? pi.SessionManager.open(launch.storage.sessionFile, undefined, launch.cwd)
 					: launch.storage.kind === "dir"
@@ -245,6 +266,7 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 						: launch.storage.kind === "memory"
 							? pi.SessionManager.inMemory(launch.cwd)
 							: pi.SessionManager.create(launch.cwd);
+				if (cold && (sessionManager.getSessionId() !== cold.expected.nativeId || sessionManager.getLeafId() !== cold.expected.leaf || sessionManager.getCwd() !== cold.expected.cwd)) throw new Error("Cold SDK open did not retain its genuine UUID/leaf/cwd; no fallback or migration.");
 				observeReadonly?.opened(sessionManager);
 				const resolvedModel = launch.model
 					? pi.resolveCliModel({ cliModel: launch.model, modelRuntime })

@@ -327,6 +327,7 @@ export interface SubagentParamsLike {
 	resume?: string;
 	message?: string;
 	steeringRecovery?: boolean;
+	nativeColdRecovery?: boolean;
 	mode?: SteerDeliveryMode | "plan" | "apply";
 	repo?: string;
 	planId?: string;
@@ -2042,6 +2043,7 @@ async function resumeAsyncRun(input: {
 
 	const sourceAsyncDir = target.source === "async" ? target.asyncDir : undefined;
 	const queuedBriefs = sourceAsyncDir ? readRevivalBriefs(sourceAsyncDir) : [];
+	if (input.params.nativeColdRecovery === true && (!input.params.message?.trim() || queuedBriefs.length)) return { content: [{ type: "text", text: "Explicit cold native recovery requires a new instruction and no retained steering queue; old work is never replayed." }], isError: true, details: { mode: "management", results: [] } };
 	const effectiveFollowUp = [...queuedBriefs.map(({ request }) => request.message), followUp].filter(Boolean).join("\n\n");
 	const revivalSessionFile = target.sessionFile;
 	if (!revivalSessionFile) {
@@ -2066,6 +2068,7 @@ async function resumeAsyncRun(input: {
 			nativeDefinitionDigest = step.definitionDigest;
 		} catch (error) { return { content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }], isError: true, details: { mode: "management", results: [] } }; }
 	}
+	if (input.params.nativeColdRecovery === true && !nativeContinuation) return { content: [{ type: "text", text: "Cold native recovery is only available for its exact admitted native conversation; no headless/external fallback." }], isError: true, details: { mode: "management", results: [] } };
 	const runId = randomUUID();
 	const topLevelResume = depth === 0 && !inheritedNestedRoute(input.deps) && !input.params.workflowParentRunId;
 	let activeAsyncCapacity: ActiveAsyncCapacityHandle | undefined;
@@ -2129,7 +2132,7 @@ async function resumeAsyncRun(input: {
 		sessionRoot: input.deps.getSubagentSessionRoot(parentSessionFile ?? revivalSessionFile),
 		...(recoveryDescriptor?.sessionDir ? { sessionDir: recoveryDescriptor.sessionDir } : {}),
 		sessionFile: revivalSessionFile,
-		...(nativeContinuation ? { nativeContinuation, nativeDefinitionDigest } : { revivalLease: {
+		...(nativeContinuation ? { nativeContinuation, nativeDefinitionDigest, ...(input.params.nativeColdRecovery === true ? { nativeColdRecovery: true } : {}) } : { revivalLease: {
 			sessionFile: revivalSessionFile,
 			runId,
 			sourceRunId: target.runId,
@@ -2260,7 +2263,7 @@ async function resumeAsyncRun(input: {
 	const revivedTarget = intercomBridge.active ? resolveSubagentIntercomTarget(revivedId, target.agent, 0) : undefined;
 	const sourceLabel = target.source;
 	const lines = [
-		nativeContinuation ? `Continued retained native child from ${target.runId}; no new host or SDK writer was started.` : `Revived ${sourceLabel} subagent from ${target.runId}.`,
+		nativeContinuation ? (input.params.nativeColdRecovery === true ? `Explicitly cold-recovered the genuine native conversation from ${target.runId} under a new WT ownership epoch; the old turn/queues were not replayed.` : `Continued retained native child from ${target.runId}; no new host or SDK writer was started.`) : `Revived ${sourceLabel} subagent from ${target.runId}.`,
 		`${nativeContinuation ? "Turn tracking run" : "Revived run"}: ${revivedId}`,
 		`Agent: ${target.agent}`,
 		`Session: ${target.sessionFile}`,
@@ -4695,6 +4698,7 @@ type GateParamsNormalizationResult =
 	| { ok: false; error: string };
 
 function normalizeGateParams(params: SubagentParamsLike): GateParamsNormalizationResult {
+	if (params.nativeColdRecovery === true && params.action !== "resume") return { ok: false, error: "nativeColdRecovery requires the explicit action='resume' operation; no automatic recovery/fallback." };
 	if (params.gate !== undefined && params.action === "resume") {
 		return { ok: false, error: "gate is not supported with action='resume'; resume uses the retained child contract." };
 	}
